@@ -368,3 +368,456 @@ fn storage_failure_on_generate_faults_and_reload_has_no_ghost_key() {
     let n = reloaded.save(&mut buf).unwrap();
     assert_eq!(&buf[..n], &f.storage.state[..]);
 }
+
+// ---- milestone 2: agent actions and policies --------------------------------
+
+mod agent {
+    use super::*;
+    use crate::agent::{
+        Action, ActionKind, CONFIRM_MESSAGE_MAX, Policy, Statement, VerifyError,
+        confirmation_message, verify_statement,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const SERIAL: [u8; 16] = *b"TESTSERIAL000001";
+
+    /// Stands in for the user's phone: a separate key behind a confirm button.
+    fn confirmer() -> SigningKey {
+        SigningKey::from_bytes(&[9; 32])
+    }
+
+    /// Payments and messages allowed. Payments up to $50, $200 in total,
+    /// anything over $20 needs the user's OK. Installing software always does.
+    fn shopping_policy() -> Policy {
+        Policy {
+            allowed: ActionKind::Payment.bit()
+                | ActionKind::SendMessage.bit()
+                | ActionKind::InstallSoftware.bit(),
+            max_amount: 5_000,
+            budget: 20_000,
+            confirm_above: 2_000,
+            always_confirm: ActionKind::InstallSoftware.bit(),
+            confirmer: Some(confirmer().verifying_key().to_bytes()),
+        }
+    }
+
+    fn pay(cents: u64, to: &[u8]) -> Action<'_> {
+        Action {
+            kind: ActionKind::Payment,
+            amount: cents,
+            target: to,
+            details: b"",
+        }
+    }
+
+    impl Fixture {
+        fn agent_key(&mut self, policy: Policy) -> resp::Generated {
+            let (status, payload) = self.call(Request::GenerateAgentKey {
+                label: b"agent",
+                ext_id: b"",
+                policy,
+            });
+            assert_eq!(status, Status::Ok);
+            resp::Generated::decode(&payload).unwrap()
+        }
+
+        fn act(
+            &mut self,
+            key: u32,
+            action: Action<'_>,
+            conf: Option<[u8; 64]>,
+        ) -> Result<(Vec<u8>, [u8; 64]), Status> {
+            let (status, payload) = self.call(Request::SignAction {
+                key,
+                action,
+                confirmation: conf,
+            });
+            if status != Status::Ok {
+                return Err(status);
+            }
+            let (stmt, sig) = resp::decode_signed_action(&payload).unwrap();
+            Ok((stmt.to_vec(), sig))
+        }
+
+        fn challenge(&mut self) -> [u8; 32] {
+            let (status, payload) = self.call(Request::GetChallenge);
+            assert_eq!(status, Status::Ok);
+            resp::decode_challenge(&payload).unwrap()
+        }
+
+        /// What the user's device does after showing the action and the user taps "Approve".
+        fn confirm(&mut self, key: u32, action: &Action<'_>, by: &SigningKey) -> [u8; 64] {
+            let challenge = self.challenge();
+            let mut msg = [0u8; CONFIRM_MESSAGE_MAX];
+            let n = confirmation_message(&mut msg, &SERIAL, &challenge, key, action).unwrap();
+            by.sign(&msg[..n]).to_bytes()
+        }
+
+        fn policy_state(&mut self, key: u32) -> resp::KeyPolicy {
+            let (status, payload) = self.call(Request::GetKeyPolicy { key });
+            assert_eq!(status, Status::Ok);
+            resp::KeyPolicy::decode(&payload).unwrap()
+        }
+    }
+
+    #[test]
+    fn allowed_payment_is_signed_as_a_statement_anyone_can_check() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let (stmt, sig) = f
+            .act(k.key, pay(1_500, b"coffee-shop.example"), None)
+            .unwrap();
+
+        let s = verify_statement(&k.public, &stmt, &sig).unwrap();
+        assert_eq!(s.serial, SERIAL);
+        assert_eq!(s.key, k.key);
+        assert_eq!(s.sequence, 1);
+        assert_eq!(s.action, pay(1_500, b"coffee-shop.example"));
+        assert!(!s.confirmed);
+        assert_eq!(s.policy_digest, shopping_policy().digest());
+
+        let state = f.policy_state(k.key);
+        assert_eq!((state.spent, state.approved), (1_500, 1));
+    }
+
+    #[test]
+    fn tampered_statements_fail_verification() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let (mut stmt, sig) = f.act(k.key, pay(1_500, b"shop"), None).unwrap();
+        let other = SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes();
+        assert_eq!(
+            verify_statement(&other, &stmt, &sig),
+            Err(VerifyError::BadSignature)
+        );
+        let last = stmt.len() - 40; // inside the amount/target area
+        stmt[last] ^= 1;
+        assert!(verify_statement(&k.public, &stmt, &sig).is_err());
+    }
+
+    #[test]
+    fn disallowed_kinds_are_refused() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let delete = Action {
+            kind: ActionKind::DeleteData,
+            amount: 0,
+            target: b"photos",
+            details: b"",
+        };
+        assert_eq!(f.act(k.key, delete, None), Err(Status::ActionNotAllowed));
+    }
+
+    #[test]
+    fn single_payment_cap_is_enforced() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let conf = f.confirm(k.key, &pay(5_001, b"tv-store"), &confirmer());
+        // Even with the user's confirmation: the cap is a hard rule.
+        assert_eq!(
+            f.act(k.key, pay(5_001, b"tv-store"), Some(conf)),
+            Err(Status::AmountTooHigh)
+        );
+    }
+
+    #[test]
+    fn total_budget_is_enforced_across_actions() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        for i in 1..=10 {
+            let (stmt, sig) = f.act(k.key, pay(2_000, b"shop"), None).unwrap();
+            assert_eq!(
+                verify_statement(&k.public, &stmt, &sig).unwrap().sequence,
+                i
+            );
+        }
+        // $200 spent; one more cent is over budget.
+        assert_eq!(
+            f.act(k.key, pay(1, b"shop"), None),
+            Err(Status::BudgetExceeded)
+        );
+        // Denied actions are not charged.
+        assert_eq!(f.policy_state(k.key).spent, 20_000);
+    }
+
+    #[test]
+    fn large_payments_need_a_real_user_confirmation() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let big = pay(3_000, b"airline.example");
+        assert_eq!(f.act(k.key, big, None), Err(Status::ConfirmationRequired));
+
+        let conf = f.confirm(k.key, &big, &confirmer());
+        let (stmt, sig) = f.act(k.key, big, Some(conf)).unwrap();
+        assert!(verify_statement(&k.public, &stmt, &sig).unwrap().confirmed);
+    }
+
+    #[test]
+    fn a_confirmation_cannot_be_replayed() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let big = pay(3_000, b"airline.example");
+        let conf = f.confirm(k.key, &big, &confirmer());
+        f.act(k.key, big, Some(conf)).unwrap();
+        // Same signature again: the challenge it covered is gone.
+        assert_eq!(f.act(k.key, big, Some(conf)), Err(Status::NoChallenge));
+        // Even after a fresh challenge, the old signature covers the old one.
+        f.challenge();
+        assert_eq!(
+            f.act(k.key, big, Some(conf)),
+            Err(Status::ConfirmationInvalid)
+        );
+    }
+
+    #[test]
+    fn a_confirmation_cannot_be_moved_to_a_different_action() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        // The user approves $30 to the airline; the agent tries to send $49 to itself.
+        let conf = f.confirm(k.key, &pay(3_000, b"airline.example"), &confirmer());
+        assert_eq!(
+            f.act(k.key, pay(4_900, b"attacker.example"), Some(conf)),
+            Err(Status::ConfirmationInvalid)
+        );
+        // A failed attempt still uses up the challenge.
+        assert_eq!(
+            f.act(k.key, pay(3_000, b"airline.example"), Some(conf)),
+            Err(Status::NoChallenge)
+        );
+    }
+
+    #[test]
+    fn only_the_registered_confirmation_device_counts() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let impostor = SigningKey::from_bytes(&[2; 32]);
+        let big = pay(3_000, b"airline.example");
+        let conf = f.confirm(k.key, &big, &impostor);
+        assert_eq!(
+            f.act(k.key, big, Some(conf)),
+            Err(Status::ConfirmationInvalid)
+        );
+    }
+
+    #[test]
+    fn some_kinds_always_need_confirmation() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let install = Action {
+            kind: ActionKind::InstallSoftware,
+            amount: 0,
+            target: b"com.example.app",
+            details: b"v2.1",
+        };
+        assert_eq!(
+            f.act(k.key, install, None),
+            Err(Status::ConfirmationRequired)
+        );
+        let conf = f.confirm(k.key, &install, &confirmer());
+        f.act(k.key, install, Some(conf)).unwrap();
+    }
+
+    #[test]
+    fn without_a_confirmation_device_confirmable_actions_are_impossible() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(Policy {
+            confirmer: None,
+            ..shopping_policy()
+        });
+        assert_eq!(
+            f.act(k.key, pay(3_000, b"x"), None),
+            Err(Status::ConfirmationRequired)
+        );
+        let conf = f.confirm(k.key, &pay(3_000, b"x"), &confirmer());
+        assert_eq!(
+            f.act(k.key, pay(3_000, b"x"), Some(conf)),
+            Err(Status::ConfirmationInvalid)
+        );
+        // Small payments still work.
+        f.act(k.key, pay(100, b"x"), None).unwrap();
+    }
+
+    #[test]
+    fn agent_keys_never_sign_raw_bytes_and_general_keys_never_sign_actions() {
+        let mut f = Fixture::new();
+        f.login();
+        let agent = f.agent_key(shopping_policy());
+        // An attacker on the host cannot hand-craft a "statement" for the agent key.
+        assert_eq!(
+            f.call(Request::Sign {
+                key: agent.key,
+                msg: b"QHSM-ACTION\x01forged"
+            })
+            .0,
+            Status::UsageNotAllowed
+        );
+        let general = f.generate(b"general").key;
+        assert_eq!(
+            f.act(general, pay(1, b"x"), None),
+            Err(Status::UsageNotAllowed)
+        );
+        assert_eq!(
+            f.call(Request::GetKeyPolicy { key: general }).0,
+            Status::UsageNotAllowed
+        );
+    }
+
+    #[test]
+    fn agent_actions_require_login() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        f.call(Request::Logout);
+        assert_eq!(f.act(k.key, pay(1, b"x"), None), Err(Status::NotLoggedIn));
+        assert_eq!(f.call(Request::GetChallenge).0, Status::NotLoggedIn);
+    }
+
+    #[test]
+    fn logout_discards_the_pending_challenge() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let conf = f.confirm(k.key, &pay(3_000, b"x"), &confirmer());
+        f.call(Request::Logout);
+        f.login();
+        assert_eq!(
+            f.act(k.key, pay(3_000, b"x"), Some(conf)),
+            Err(Status::NoChallenge)
+        );
+    }
+
+    #[test]
+    fn misleading_or_ambiguous_actions_are_rejected_before_any_check() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        let bad_actions = [
+            pay(0, b"free?"),                  // payment with no amount
+            pay(100, b""),                     // nobody to pay
+            pay(100, b"shop\nAmount: $1"),     // newline could fake a confirm screen
+            pay(100, "sh\u{43e}p".as_bytes()), // Cyrillic look-alike letter
+            Action {
+                kind: ActionKind::SendMessage,
+                amount: 5,
+                target: b"bob",
+                details: b"",
+            }, // amount on a non-payment
+        ];
+        for a in bad_actions {
+            let mut buf = [0u8; MAX_FRAME];
+            // Hand-encode, since the client-side encoder refuses these too.
+            let mut w = crate::wire::Writer::new(&mut buf);
+            w.u8(0x21).unwrap();
+            w.u32(k.key).unwrap();
+            w.u8(a.kind as u8).unwrap();
+            w.u64(a.amount).unwrap();
+            w.bytes(a.target).unwrap();
+            w.bytes(a.details).unwrap();
+            w.u8(0).unwrap();
+            let n = w.len();
+            assert_eq!(f.raw(&buf[..n]), vec![Status::BadRequest as u8], "{a:?}");
+        }
+        assert_eq!(f.policy_state(k.key).approved, 0);
+    }
+
+    #[test]
+    fn invalid_policies_are_rejected() {
+        let mut f = Fixture::new();
+        f.login();
+        for policy in [
+            Policy {
+                allowed: 0,
+                ..shopping_policy()
+            },
+            Policy {
+                allowed: 1 << 15,
+                ..shopping_policy()
+            },
+            Policy {
+                always_confirm: 1 << 0,
+                ..shopping_policy()
+            }, // undefined kind bit
+        ] {
+            let mut buf = [0u8; MAX_FRAME];
+            // Encode a valid request, then patch in the invalid policy bytes.
+            let n = Request::GenerateAgentKey {
+                label: b"a",
+                ext_id: b"",
+                policy: shopping_policy(),
+            }
+            .encode(&mut buf)
+            .unwrap();
+            let off = n - crate::agent::POLICY_LEN;
+            buf[off..off + 2].copy_from_slice(&policy.allowed.to_le_bytes());
+            let ac = off + 2 + 8 + 8 + 8;
+            buf[ac..ac + 2].copy_from_slice(&policy.always_confirm.to_le_bytes());
+            assert_eq!(f.raw(&buf[..n]), vec![Status::BadRequest as u8]);
+        }
+    }
+
+    #[test]
+    fn spending_is_saved_before_signing() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        f.storage.fail = true;
+        // Cannot record the spend, so no signature may be produced.
+        assert_eq!(f.act(k.key, pay(100, b"shop"), None), Err(Status::Fault));
+        let reloaded = Hsm::load(&f.storage.state).unwrap();
+        let mut buf = [0u8; STATE_MAX];
+        let n = reloaded.save(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &f.storage.state[..]);
+    }
+
+    #[test]
+    fn spending_and_sequence_survive_a_restart() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(shopping_policy());
+        f.act(k.key, pay(19_000, b"shop"), None).ok(); // over confirm threshold
+        let conf = f.confirm(k.key, &pay(5_000, b"shop"), &confirmer());
+        f.act(k.key, pay(5_000, b"shop"), Some(conf)).unwrap();
+        f.act(k.key, pay(2_000, b"shop"), None).unwrap();
+
+        f.hsm = Hsm::load(&f.storage.state).unwrap();
+        f.session = Session::default();
+        f.login();
+        let state = f.policy_state(k.key);
+        assert_eq!((state.spent, state.approved), (7_000, 2));
+        assert_eq!(state.policy, shopping_policy());
+        let (stmt, sig) = f.act(k.key, pay(100, b"shop"), None).unwrap();
+        assert_eq!(
+            verify_statement(&k.public, &stmt, &sig).unwrap().sequence,
+            3
+        );
+    }
+
+    #[test]
+    fn statements_round_trip() {
+        let s = Statement {
+            serial: SERIAL,
+            key: 7,
+            sequence: 42,
+            action: pay(1_234, b"shop"),
+            confirmed: true,
+            policy_digest: [3; 32],
+        };
+        let mut buf = [0u8; crate::agent::MAX_STATEMENT];
+        let mut w = crate::wire::Writer::new(&mut buf);
+        s.write(&mut w).unwrap();
+        let n = w.len();
+        assert_eq!(Statement::decode(&buf[..n]).unwrap(), s);
+        assert!(Statement::decode(&buf[..n - 1]).is_err());
+    }
+}

@@ -20,3 +20,4 @@ jobs:
       - name: Core builds for the RP2350 microcontroller (no OS)
         run: cargo build -p quorum-core --release --target thumbv8m.main-none-eabihf
       - run: ./scripts/demo.sh
+      - run: ./scripts/demo-agent.sh

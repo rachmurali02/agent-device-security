@@ -113,6 +113,10 @@ fn log(req: &[u8], out: &[u8]) {
         Ok(Request::ListKeys) => "ListKeys",
         Ok(Request::Sign { .. }) => "Sign",
         Ok(Request::DeleteKey { .. }) => "DeleteKey",
+        Ok(Request::GenerateAgentKey { .. }) => "GenAgentKey",
+        Ok(Request::GetChallenge) => "Challenge",
+        Ok(Request::SignAction { .. }) => "SignAction",
+        Ok(Request::GetKeyPolicy { .. }) => "GetPolicy",
         Err(_) => "<malformed>",
     };
     match resp::split(out) {

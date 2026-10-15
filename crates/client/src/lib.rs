@@ -1,4 +1,4 @@
-//! Connection from the PKCS#11 library to the HSM over a Unix socket.
+//! Host-side connection to the HSM over a Unix socket.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;

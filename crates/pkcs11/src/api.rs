@@ -16,11 +16,11 @@ use quorum_core::wire::{
     MAX_EXT_ID, MAX_LABEL, MAX_MESSAGE, MAX_PIN, MIN_PIN, Request, SIGNATURE_LEN, Status, resp,
 };
 
-use crate::client::{self, Client};
 use crate::function_list::FUNCTION_LIST;
 use crate::objects::{
     Attr, CK_UNAVAILABLE_INFORMATION, Half, KeyObject, handle, is_ed25519_params, split_handle,
 };
+use quorum_client::{self as client, Client};
 
 const SLOT_ID: CK_SLOT_ID = 0;
 const MECHANISMS: [CK_MECHANISM_TYPE; 2] = [CKM_EC_EDWARDS_KEY_PAIR_GEN, CKM_EDDSA];
@@ -69,6 +69,14 @@ fn status_to_rv(s: Status) -> CK_RV {
         Status::KeyNotFound => CKR_KEY_HANDLE_INVALID,
         Status::StoreFull => CKR_DEVICE_MEMORY,
         Status::BadRequest | Status::ResponseTooLarge | Status::Fault => CKR_DEVICE_ERROR,
+        // Agent keys refuse raw signing; agent actions go through quorum-cli.
+        Status::UsageNotAllowed => CKR_KEY_FUNCTION_NOT_PERMITTED,
+        Status::ActionNotAllowed
+        | Status::AmountTooHigh
+        | Status::BudgetExceeded
+        | Status::ConfirmationRequired
+        | Status::ConfirmationInvalid
+        | Status::NoChallenge => CKR_FUNCTION_REJECTED,
     }
 }
 
@@ -98,6 +106,7 @@ impl Library {
                 label: e.label.to_vec(),
                 ext_id: e.ext_id.to_vec(),
                 public: e.public,
+                usage: e.usage,
             })
             .collect())
     }
@@ -687,6 +696,10 @@ pub unsafe extern "C" fn C_SignInit(
         let (obj, half) = lib.object(key).map_err(|_| CKR_KEY_HANDLE_INVALID)?;
         if half != Half::Private {
             return Err(CKR_KEY_TYPE_INCONSISTENT);
+        }
+        // Reported early for a clear error; the HSM enforces it regardless.
+        if !obj.can_sign_raw() {
+            return Err(CKR_KEY_FUNCTION_NOT_PERMITTED);
         }
         lib.session(session)?.sign_key = Some(obj.key);
         Ok(())

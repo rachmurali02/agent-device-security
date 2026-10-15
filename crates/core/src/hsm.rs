@@ -2,25 +2,30 @@
 //!
 //! The host sends request frames; `Hsm::handle` decides whether to honour
 //! them and writes a response frame. Every security decision (is the caller
-//! logged in, is the PIN right, does the key exist) is made here, never in
-//! the host library.
+//! logged in, is the PIN right, does the key exist, does this agent action
+//! follow the key's rules) is made here, never in the host library.
 
 use rand_core::CryptoRngCore;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::keystore::{KeyStore, MAX_KEYS, SECRET_LEN};
+use crate::agent::{
+    Action, CHALLENGE_LEN, MAX_STATEMENT, POLICY_LEN, Policy, Statement, confirmation_valid,
+};
+use crate::keystore::{KeyMeta, KeyStore, MAX_KEYS, SECRET_LEN, UseError};
 use crate::wire::{
-    MAX_EXT_ID, MAX_LABEL, MAX_PIN, MIN_PIN, Reader, Request, SERIAL_LEN, Status, WireError,
-    Writer, resp,
+    KeyUsage, MAX_EXT_ID, MAX_LABEL, MAX_PIN, MIN_PIN, Reader, Request, SERIAL_LEN, SIGNATURE_LEN,
+    Status, WireError, Writer, resp,
 };
 
-pub const FW_VERSION: (u8, u8) = (0, 1);
+pub const FW_VERSION: (u8, u8) = (0, 2);
 pub const MAX_PIN_TRIES: u8 = 5;
 
 const STATE_MAGIC: &[u8; 4] = b"QHSM";
-const STATE_VERSION: u8 = 1;
-const SLOT_STATE_LEN: usize = 4 + 1 + MAX_LABEL + 1 + MAX_EXT_ID + SECRET_LEN;
+const STATE_VERSION: u8 = 2;
+/// Worst case per key: an agent key, which also stores its policy and counters.
+const SLOT_STATE_LEN: usize =
+    4 + 1 + MAX_LABEL + 1 + MAX_EXT_ID + SECRET_LEN + 1 + POLICY_LEN + 8 + 8;
 /// Upper bound on the serialized state size.
 pub const STATE_MAX: usize =
     4 + 1 + SERIAL_LEN + 1 + MAX_PIN + 1 + 4 + 1 + MAX_KEYS * SLOT_STATE_LEN;
@@ -55,6 +60,9 @@ pub enum InitError {
 #[derive(Debug, Default)]
 pub struct Session {
     logged_in: bool,
+    /// One-time challenge for the next user confirmation. Consumed by the
+    /// first `SignAction` that presents a confirmation, valid or not.
+    challenge: Option<[u8; CHALLENGE_LEN]>,
 }
 
 impl Session {
@@ -169,7 +177,7 @@ impl Hsm {
             Request::Login { pin } => self.login(session, storage, pin),
 
             Request::Logout => {
-                session.logged_in = false;
+                *session = Session::default();
                 Ok(())
             }
 
@@ -177,7 +185,7 @@ impl Hsm {
                 require_login(session)?;
                 let (id, public) = self
                     .store
-                    .generate(rng, label, ext_id)
+                    .generate(rng, KeyMeta::general(label, ext_id))
                     .map_err(|_| Status::StoreFull)?;
                 // The key does not exist until it is durable. If the commit
                 // fails we fault rather than hand out a key that a restart
@@ -197,6 +205,7 @@ impl Hsm {
                         label: slot.label(),
                         ext_id: slot.ext_id(),
                         public: slot.public,
+                        usage: slot.usage,
                     }
                     .encode(w)
                     .map_err(overflow)?;
@@ -206,7 +215,7 @@ impl Hsm {
 
             Request::Sign { key, msg } => {
                 require_login(session)?;
-                let sig = self.store.sign(key, msg).ok_or(Status::KeyNotFound)?;
+                let sig = self.store.sign(key, msg).map_err(use_error)?;
                 w.raw(&sig).map_err(overflow)
             }
 
@@ -217,7 +226,132 @@ impl Hsm {
                 }
                 self.commit(storage)
             }
+
+            Request::GenerateAgentKey {
+                label,
+                ext_id,
+                policy,
+            } => {
+                require_login(session)?;
+                let (id, public) = self
+                    .store
+                    .generate(rng, KeyMeta::agent(label, ext_id, policy))
+                    .map_err(|_| Status::StoreFull)?;
+                self.commit(storage)?;
+                w.u32(id).map_err(overflow)?;
+                w.raw(&public).map_err(overflow)
+            }
+
+            Request::GetChallenge => {
+                require_login(session)?;
+                let mut challenge = [0u8; CHALLENGE_LEN];
+                rng.fill_bytes(&mut challenge);
+                session.challenge = Some(challenge);
+                w.raw(&challenge).map_err(overflow)
+            }
+
+            Request::SignAction {
+                key,
+                action,
+                confirmation,
+            } => self.sign_action(session, storage, key, &action, confirmation, w),
+
+            // Rules are public: anyone may read them, and they are bound
+            // into every statement by digest anyway.
+            Request::GetKeyPolicy { key } => {
+                let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
+                if slot.usage != KeyUsage::Agent {
+                    return Err(Status::UsageNotAllowed);
+                }
+                resp::KeyPolicy {
+                    policy: slot.policy,
+                    spent: slot.spent,
+                    approved: slot.approved,
+                }
+                .encode(w)
+                .map_err(overflow)
+            }
         }
+    }
+
+    /// The policy check for agent actions. Checks run in a fixed order and
+    /// the first failure wins; nothing is charged or signed unless all pass.
+    fn sign_action(
+        &mut self,
+        session: &mut Session,
+        storage: &mut impl Storage,
+        key: u32,
+        action: &Action<'_>,
+        confirmation: Option<[u8; SIGNATURE_LEN]>,
+        w: &mut Writer<'_>,
+    ) -> Result<(), Status> {
+        require_login(session)?;
+        let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
+        if slot.usage != KeyUsage::Agent {
+            return Err(Status::UsageNotAllowed);
+        }
+        let policy: Policy = slot.policy;
+
+        // 1. Is this kind of action allowed at all?
+        if !policy.allows(action.kind) {
+            return Err(Status::ActionNotAllowed);
+        }
+        // 2. Is this single payment small enough?
+        if action.amount > policy.max_amount {
+            return Err(Status::AmountTooHigh);
+        }
+        // 3. Would it go over the total budget?
+        match slot.spent.checked_add(action.amount) {
+            Some(total) if total <= policy.budget => {}
+            _ => return Err(Status::BudgetExceeded),
+        }
+        // 4. Does it need the user's confirmation, and is the one given real?
+        let confirmed = match confirmation {
+            Some(sig) => {
+                // A presented confirmation always uses up the challenge, so
+                // each one can be tried exactly once.
+                let challenge = session.challenge.take().ok_or(Status::NoChallenge)?;
+                let confirmer = policy.confirmer.ok_or(Status::ConfirmationInvalid)?;
+                if !confirmation_valid(&confirmer, &self.serial, &challenge, key, action, &sig) {
+                    return Err(Status::ConfirmationInvalid);
+                }
+                true
+            }
+            None if policy.needs_confirmation(action) => {
+                return Err(Status::ConfirmationRequired);
+            }
+            None => false,
+        };
+
+        // All checks passed. Charge the action and make that durable *before*
+        // signing: a crash or power cut can never yield a signature that
+        // was not counted against the budget, or reuse a sequence number.
+        let sequence = self
+            .store
+            .charge(key, action.amount)
+            .ok_or(Status::BudgetExceeded)?;
+        self.commit(storage)?;
+
+        let statement = Statement {
+            serial: self.serial,
+            key,
+            sequence,
+            action: *action,
+            confirmed,
+            policy_digest: policy.digest(),
+        };
+        let mut buf = [0u8; MAX_STATEMENT];
+        let mut sw = Writer::new(&mut buf);
+        statement.write(&mut sw).map_err(|_| Status::Fault)?;
+        let len = sw.len();
+        let sig = self
+            .store
+            .sign_statement(key, &buf[..len])
+            .map_err(use_error)?;
+
+        let overflow = |_: WireError| Status::ResponseTooLarge;
+        w.bytes(&buf[..len]).map_err(overflow)?;
+        w.raw(&sig).map_err(overflow)
     }
 
     fn login(
@@ -300,6 +434,12 @@ impl Hsm {
             w.u8(slot.ext_id_len)?;
             w.raw(&slot.ext_id)?;
             w.raw(&slot.secret)?;
+            w.u8(slot.usage as u8)?;
+            if slot.usage == KeyUsage::Agent {
+                slot.policy.write(&mut w)?;
+                w.u64(slot.spent)?;
+                w.u64(slot.approved)?;
+            }
         }
         Ok(w.len())
     }
@@ -343,16 +483,16 @@ impl Hsm {
             let ext_len = r.u8().map_err(bad)? as usize;
             let ext_id: [u8; MAX_EXT_ID] = r.array().map_err(bad)?;
             let mut secret: [u8; SECRET_LEN] = r.array().map_err(bad)?;
+            let meta = read_key_meta(&mut r, &label, label_len, &ext_id, ext_len);
             let valid = id != 0
                 && id < next_id
                 && label_len <= MAX_LABEL
                 && ext_len <= MAX_EXT_ID
                 && hsm.store.public_key(id).is_none();
-            let inserted = valid
-                && hsm
-                    .store
-                    .insert_with_id(id, &secret, &label[..label_len], &ext_id[..ext_len])
-                    .is_ok();
+            let inserted = match meta {
+                Ok(meta) if valid => hsm.store.insert_with_id(id, &secret, meta).is_ok(),
+                _ => false,
+            };
             secret.zeroize();
             if !inserted {
                 return Err(StateError::Malformed);
@@ -361,6 +501,42 @@ impl Hsm {
         r.finish().map_err(bad)?;
         hsm.store.set_next_id(next_id);
         Ok(hsm)
+    }
+}
+
+/// Reads a key's usage and, for agent keys, its policy and counters.
+fn read_key_meta<'a>(
+    r: &mut Reader<'_>,
+    label: &'a [u8; MAX_LABEL],
+    label_len: usize,
+    ext_id: &'a [u8; MAX_EXT_ID],
+    ext_len: usize,
+) -> Result<KeyMeta<'a>, StateError> {
+    let bad = |_: WireError| StateError::Malformed;
+    let label = label.get(..label_len).ok_or(StateError::Malformed)?;
+    let ext_id = ext_id.get(..ext_len).ok_or(StateError::Malformed)?;
+    match KeyUsage::try_from(r.u8().map_err(bad)?).map_err(bad)? {
+        KeyUsage::General => Ok(KeyMeta::general(label, ext_id)),
+        KeyUsage::Agent => {
+            let policy = Policy::read(r).map_err(bad)?;
+            let spent = r.u64().map_err(bad)?;
+            let approved = r.u64().map_err(bad)?;
+            if spent > policy.budget {
+                return Err(StateError::Malformed);
+            }
+            Ok(KeyMeta {
+                spent,
+                approved,
+                ..KeyMeta::agent(label, ext_id, policy)
+            })
+        }
+    }
+}
+
+fn use_error(e: UseError) -> Status {
+    match e {
+        UseError::NotFound => Status::KeyNotFound,
+        UseError::WrongUsage => Status::UsageNotAllowed,
     }
 }
 

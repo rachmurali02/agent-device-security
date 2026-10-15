@@ -8,10 +8,20 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand_core::CryptoRngCore;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::wire::{MAX_EXT_ID, MAX_LABEL, PUBLIC_KEY_LEN, SIGNATURE_LEN};
+use crate::agent::Policy;
+use crate::wire::{KeyUsage, MAX_EXT_ID, MAX_LABEL, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 
 pub const MAX_KEYS: usize = 16;
 pub const SECRET_LEN: usize = 32;
+
+const NO_POLICY: Policy = Policy {
+    allowed: 0,
+    max_amount: 0,
+    budget: 0,
+    confirm_above: 0,
+    always_confirm: 0,
+    confirmer: None,
+};
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct Slot {
@@ -23,6 +33,14 @@ pub(crate) struct Slot {
     pub(crate) ext_id_len: u8,
     pub(crate) secret: [u8; SECRET_LEN],
     pub(crate) public: [u8; PUBLIC_KEY_LEN],
+    #[zeroize(skip)]
+    pub(crate) usage: KeyUsage,
+    /// Meaningful only for agent keys.
+    pub(crate) policy: Policy,
+    /// Agent keys: total spent, in cents. Only ever goes up.
+    pub(crate) spent: u64,
+    /// Agent keys: number of approved actions. Only ever goes up.
+    pub(crate) approved: u64,
 }
 
 impl Slot {
@@ -35,6 +53,10 @@ impl Slot {
         ext_id_len: 0,
         secret: [0; SECRET_LEN],
         public: [0; PUBLIC_KEY_LEN],
+        usage: KeyUsage::General,
+        policy: NO_POLICY,
+        spent: 0,
+        approved: 0,
     };
 
     pub fn label(&self) -> &[u8] {
@@ -52,6 +74,45 @@ pub enum StoreError {
     FieldTooLong,
     /// Key IDs are never reused; the 32-bit space is exhausted.
     IdsExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseError {
+    NotFound,
+    /// The key exists but its usage forbids this operation.
+    WrongUsage,
+}
+
+/// What a key is, when it is created or restored.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyMeta<'a> {
+    pub label: &'a [u8],
+    pub ext_id: &'a [u8],
+    pub usage: KeyUsage,
+    pub policy: Policy,
+    pub spent: u64,
+    pub approved: u64,
+}
+
+impl<'a> KeyMeta<'a> {
+    pub fn general(label: &'a [u8], ext_id: &'a [u8]) -> Self {
+        KeyMeta {
+            label,
+            ext_id,
+            usage: KeyUsage::General,
+            policy: NO_POLICY,
+            spent: 0,
+            approved: 0,
+        }
+    }
+
+    pub fn agent(label: &'a [u8], ext_id: &'a [u8], policy: Policy) -> Self {
+        KeyMeta {
+            usage: KeyUsage::Agent,
+            policy,
+            ..Self::general(label, ext_id)
+        }
+    }
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -84,42 +145,31 @@ impl KeyStore {
         self.len() == 0
     }
 
-    pub fn generate(
+    pub(crate) fn generate(
         &mut self,
         rng: &mut impl CryptoRngCore,
-        label: &[u8],
-        ext_id: &[u8],
-    ) -> Result<(u32, [u8; PUBLIC_KEY_LEN]), StoreError> {
-        let mut secret = [0u8; SECRET_LEN];
-        rng.fill_bytes(&mut secret);
-        let result = self.insert(&secret, label, ext_id);
-        secret.zeroize();
-        result
-    }
-
-    /// Inserts a key with a caller-chosen secret. Crate-private: only key
-    /// generation and state import may introduce key material.
-    pub(crate) fn insert(
-        &mut self,
-        secret: &[u8; SECRET_LEN],
-        label: &[u8],
-        ext_id: &[u8],
+        meta: KeyMeta<'_>,
     ) -> Result<(u32, [u8; PUBLIC_KEY_LEN]), StoreError> {
         let id = self.next_id;
         let next = id.checked_add(1).ok_or(StoreError::IdsExhausted)?;
-        self.insert_with_id(id, secret, label, ext_id)?;
+        let mut secret = [0u8; SECRET_LEN];
+        rng.fill_bytes(&mut secret);
+        let result = self.insert_with_id(id, &secret, meta);
+        secret.zeroize();
+        result?;
         self.next_id = next;
         Ok((id, self.get(id).map(|s| s.public).unwrap_or_default()))
     }
 
+    /// Crate-private: only key generation and state import may introduce
+    /// key material.
     pub(crate) fn insert_with_id(
         &mut self,
         id: u32,
         secret: &[u8; SECRET_LEN],
-        label: &[u8],
-        ext_id: &[u8],
+        meta: KeyMeta<'_>,
     ) -> Result<(), StoreError> {
-        if label.len() > MAX_LABEL || ext_id.len() > MAX_EXT_ID {
+        if meta.label.len() > MAX_LABEL || meta.ext_id.len() > MAX_EXT_ID {
             return Err(StoreError::FieldTooLong);
         }
         let slot = self
@@ -128,16 +178,21 @@ impl KeyStore {
             .find(|s| !s.used)
             .ok_or(StoreError::Full)?;
         let signing = SigningKey::from_bytes(secret);
-        slot.used = true;
-        slot.id = id;
-        slot.label = [0; MAX_LABEL];
-        slot.label[..label.len()].copy_from_slice(label);
-        slot.label_len = label.len() as u8;
-        slot.ext_id = [0; MAX_EXT_ID];
-        slot.ext_id[..ext_id.len()].copy_from_slice(ext_id);
-        slot.ext_id_len = ext_id.len() as u8;
-        slot.secret = *secret;
-        slot.public = signing.verifying_key().to_bytes();
+        *slot = Slot {
+            used: true,
+            id,
+            label_len: meta.label.len() as u8,
+            ext_id_len: meta.ext_id.len() as u8,
+            secret: *secret,
+            public: signing.verifying_key().to_bytes(),
+            usage: meta.usage,
+            policy: meta.policy,
+            spent: meta.spent,
+            approved: meta.approved,
+            ..Slot::EMPTY
+        };
+        slot.label[..meta.label.len()].copy_from_slice(meta.label);
+        slot.ext_id[..meta.ext_id.len()].copy_from_slice(meta.ext_id);
         Ok(())
     }
 
@@ -145,21 +200,60 @@ impl KeyStore {
         self.slots.iter().find(|s| s.used && s.id == id)
     }
 
+    fn get_mut(&mut self, id: u32) -> Option<&mut Slot> {
+        self.slots.iter_mut().find(|s| s.used && s.id == id)
+    }
+
     pub fn public_key(&self, id: u32) -> Option<[u8; PUBLIC_KEY_LEN]> {
         self.get(id).map(|s| s.public)
     }
 
-    pub fn sign(&self, id: u32, msg: &[u8]) -> Option<[u8; SIGNATURE_LEN]> {
-        let slot = self.get(id)?;
+    /// Raw signing: general-purpose keys only. An agent key must never sign
+    /// bytes the host chose, or its policy could be bypassed.
+    pub fn sign(&self, id: u32, msg: &[u8]) -> Result<[u8; SIGNATURE_LEN], UseError> {
+        self.sign_as(id, KeyUsage::General, msg)
+    }
+
+    /// Signs a statement the HSM itself built. Agent keys only.
+    pub(crate) fn sign_statement(
+        &self,
+        id: u32,
+        statement: &[u8],
+    ) -> Result<[u8; SIGNATURE_LEN], UseError> {
+        self.sign_as(id, KeyUsage::Agent, statement)
+    }
+
+    fn sign_as(
+        &self,
+        id: u32,
+        usage: KeyUsage,
+        msg: &[u8],
+    ) -> Result<[u8; SIGNATURE_LEN], UseError> {
+        let slot = self.get(id).ok_or(UseError::NotFound)?;
+        if slot.usage != usage {
+            return Err(UseError::WrongUsage);
+        }
         // SigningKey zeroizes itself on drop (ed25519-dalek "zeroize" feature).
         let signing = SigningKey::from_bytes(&slot.secret);
-        Some(signing.sign(msg).to_bytes())
+        Ok(signing.sign(msg).to_bytes())
+    }
+
+    /// Charges an approved action to an agent key: adds `amount` to what it
+    /// has spent and returns the action's sequence number.
+    pub(crate) fn charge(&mut self, id: u32, amount: u64) -> Option<u64> {
+        let slot = self.get_mut(id)?;
+        let spent = slot.spent.checked_add(amount)?;
+        let approved = slot.approved.checked_add(1)?;
+        slot.spent = spent;
+        slot.approved = approved;
+        Some(approved)
     }
 
     pub fn delete(&mut self, id: u32) -> bool {
-        match self.slots.iter_mut().find(|s| s.used && s.id == id) {
+        match self.get_mut(id) {
             Some(slot) => {
                 slot.zeroize();
+                *slot = Slot::EMPTY;
                 true
             }
             None => false,

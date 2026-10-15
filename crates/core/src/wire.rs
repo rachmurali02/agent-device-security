@@ -19,6 +19,8 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 pub const SERIAL_LEN: usize = 16;
 
+use crate::agent::{Action, Policy};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {
     /// Input ended before a field was complete.
@@ -31,6 +33,8 @@ pub enum WireError {
     Overflow,
     /// Unknown command or status byte.
     UnknownTag,
+    /// Well-formed bytes with a value the protocol does not allow.
+    Invalid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +47,10 @@ pub enum Cmd {
     ListKeys = 0x11,
     Sign = 0x12,
     DeleteKey = 0x13,
+    GenerateAgentKey = 0x14,
+    GetChallenge = 0x20,
+    SignAction = 0x21,
+    GetKeyPolicy = 0x22,
 }
 
 impl TryFrom<u8> for Cmd {
@@ -56,6 +64,10 @@ impl TryFrom<u8> for Cmd {
             0x11 => Cmd::ListKeys,
             0x12 => Cmd::Sign,
             0x13 => Cmd::DeleteKey,
+            0x14 => Cmd::GenerateAgentKey,
+            0x20 => Cmd::GetChallenge,
+            0x21 => Cmd::SignAction,
+            0x22 => Cmd::GetKeyPolicy,
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -75,6 +87,16 @@ pub enum Status {
     ResponseTooLarge = 0x08,
     /// Persistent storage failed; the HSM refuses all commands until restart.
     Fault = 0x09,
+    /// The key exists but may not be used this way (e.g. raw signing with
+    /// an agent key).
+    UsageNotAllowed = 0x0a,
+    // Policy decisions for agent actions.
+    ActionNotAllowed = 0x10,
+    AmountTooHigh = 0x11,
+    BudgetExceeded = 0x12,
+    ConfirmationRequired = 0x13,
+    ConfirmationInvalid = 0x14,
+    NoChallenge = 0x15,
 }
 
 impl TryFrom<u8> for Status {
@@ -91,6 +113,13 @@ impl TryFrom<u8> for Status {
             0x07 => Status::StoreFull,
             0x08 => Status::ResponseTooLarge,
             0x09 => Status::Fault,
+            0x0a => Status::UsageNotAllowed,
+            0x10 => Status::ActionNotAllowed,
+            0x11 => Status::AmountTooHigh,
+            0x12 => Status::BudgetExceeded,
+            0x13 => Status::ConfirmationRequired,
+            0x14 => Status::ConfirmationInvalid,
+            0x15 => Status::NoChallenge,
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -129,6 +158,10 @@ impl<'a> Reader<'a> {
 
     pub fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(self.array()?))
+    }
+
+    pub fn u64(&mut self) -> Result<u64, WireError> {
+        Ok(u64::from_le_bytes(self.array()?))
     }
 
     /// A `u16`-length-prefixed byte string of at most `max` bytes.
@@ -184,6 +217,10 @@ impl<'a> Writer<'a> {
         self.raw(&v.to_le_bytes())
     }
 
+    pub fn u64(&mut self, v: u64) -> Result<(), WireError> {
+        self.raw(&v.to_le_bytes())
+    }
+
     pub fn bytes(&mut self, data: &[u8]) -> Result<(), WireError> {
         let len = u16::try_from(data.len()).map_err(|_| WireError::TooLong)?;
         self.u16(len)?;
@@ -220,6 +257,24 @@ pub enum Request<'a> {
     DeleteKey {
         key: u32,
     },
+    /// Create a key that can only sign agent actions allowed by `policy`.
+    GenerateAgentKey {
+        label: &'a [u8],
+        ext_id: &'a [u8],
+        policy: Policy,
+    },
+    /// Get a fresh one-time challenge for a user confirmation.
+    GetChallenge,
+    /// Ask the HSM to approve and sign an agent action. `confirmation` is the
+    /// user's confirmation-device signature, when the policy needs one.
+    SignAction {
+        key: u32,
+        action: Action<'a>,
+        confirmation: Option<[u8; SIGNATURE_LEN]>,
+    },
+    GetKeyPolicy {
+        key: u32,
+    },
 }
 
 impl<'a> Request<'a> {
@@ -241,6 +296,22 @@ impl<'a> Request<'a> {
                 msg: r.bytes(MAX_MESSAGE)?,
             },
             Cmd::DeleteKey => Request::DeleteKey { key: r.u32()? },
+            Cmd::GenerateAgentKey => Request::GenerateAgentKey {
+                label: r.bytes(MAX_LABEL)?,
+                ext_id: r.bytes(MAX_EXT_ID)?,
+                policy: Policy::read(&mut r)?,
+            },
+            Cmd::GetChallenge => Request::GetChallenge,
+            Cmd::SignAction => Request::SignAction {
+                key: r.u32()?,
+                action: Action::read(&mut r)?,
+                confirmation: match r.u8()? {
+                    0 => None,
+                    1 => Some(r.array()?),
+                    _ => return Err(WireError::Invalid),
+                },
+            },
+            Cmd::GetKeyPolicy => Request::GetKeyPolicy { key: r.u32()? },
         };
         r.finish()?;
         Ok(req)
@@ -268,6 +339,37 @@ impl<'a> Request<'a> {
             }
             Request::DeleteKey { key } => {
                 w.u8(Cmd::DeleteKey as u8)?;
+                w.u32(key)?;
+            }
+            Request::GenerateAgentKey {
+                label,
+                ext_id,
+                policy,
+            } => {
+                w.u8(Cmd::GenerateAgentKey as u8)?;
+                w.bytes(label)?;
+                w.bytes(ext_id)?;
+                policy.write(&mut w)?;
+            }
+            Request::GetChallenge => w.u8(Cmd::GetChallenge as u8)?,
+            Request::SignAction {
+                key,
+                action,
+                confirmation,
+            } => {
+                w.u8(Cmd::SignAction as u8)?;
+                w.u32(key)?;
+                action.write(&mut w)?;
+                match confirmation {
+                    None => w.u8(0)?,
+                    Some(sig) => {
+                        w.u8(1)?;
+                        w.raw(&sig)?;
+                    }
+                }
+            }
+            Request::GetKeyPolicy { key } => {
+                w.u8(Cmd::GetKeyPolicy as u8)?;
                 w.u32(key)?;
             }
         }
@@ -344,6 +446,7 @@ pub mod resp {
         pub label: &'a [u8],
         pub ext_id: &'a [u8],
         pub public: [u8; PUBLIC_KEY_LEN],
+        pub usage: KeyUsage,
     }
 
     impl KeyEntry<'_> {
@@ -351,7 +454,8 @@ pub mod resp {
             w.u32(self.key)?;
             w.bytes(self.label)?;
             w.bytes(self.ext_id)?;
-            w.raw(&self.public)
+            w.raw(&self.public)?;
+            w.u8(self.usage as u8)
         }
     }
 
@@ -376,6 +480,7 @@ pub mod resp {
             label: r.bytes(MAX_LABEL)?,
             ext_id: r.bytes(MAX_EXT_ID)?,
             public: r.array()?,
+            usage: KeyUsage::try_from(r.u8()?)?,
         })
     }
 
@@ -406,5 +511,73 @@ pub mod resp {
     pub fn split(frame: &[u8]) -> Result<(Status, &[u8]), WireError> {
         let (&status, payload) = frame.split_first().ok_or(WireError::Truncated)?;
         Ok((Status::try_from(status)?, payload))
+    }
+
+    /// `SignAction` payload: `[statement: bytes] [signature: 64]`.
+    pub fn decode_signed_action(payload: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireError> {
+        let mut r = Reader::new(payload);
+        let statement = r.bytes(crate::agent::MAX_STATEMENT)?;
+        let sig = r.array()?;
+        r.finish()?;
+        Ok((statement, sig))
+    }
+
+    /// `GetKeyPolicy` payload.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct KeyPolicy {
+        pub policy: Policy,
+        /// Total spent so far, in cents.
+        pub spent: u64,
+        /// Number of actions approved so far (the last sequence number).
+        pub approved: u64,
+    }
+
+    impl KeyPolicy {
+        pub fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
+            self.policy.write(w)?;
+            w.u64(self.spent)?;
+            w.u64(self.approved)
+        }
+
+        pub fn decode(payload: &[u8]) -> Result<Self, WireError> {
+            let mut r = Reader::new(payload);
+            let kp = KeyPolicy {
+                policy: Policy::read(&mut r)?,
+                spent: r.u64()?,
+                approved: r.u64()?,
+            };
+            r.finish()?;
+            Ok(kp)
+        }
+    }
+
+    pub fn decode_challenge(
+        payload: &[u8],
+    ) -> Result<[u8; crate::agent::CHALLENGE_LEN], WireError> {
+        let mut r = Reader::new(payload);
+        let c = r.array()?;
+        r.finish()?;
+        Ok(c)
+    }
+}
+
+/// What a key may be used for. Fixed when the key is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KeyUsage {
+    /// Signs any bytes the logged-in user asks for (classic HSM behaviour).
+    General = 0,
+    /// Signs only agent actions that pass the key's policy.
+    Agent = 1,
+}
+
+impl TryFrom<u8> for KeyUsage {
+    type Error = WireError;
+    fn try_from(b: u8) -> Result<Self, WireError> {
+        match b {
+            0 => Ok(KeyUsage::General),
+            1 => Ok(KeyUsage::Agent),
+            _ => Err(WireError::UnknownTag),
+        }
     }
 }

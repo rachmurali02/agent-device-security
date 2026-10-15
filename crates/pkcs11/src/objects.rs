@@ -5,6 +5,7 @@
 //! library keeps no object table of its own.
 
 use cryptoki_sys::*;
+use quorum_core::wire::KeyUsage;
 
 pub const CK_UNAVAILABLE_INFORMATION: CK_ULONG = !0;
 
@@ -33,6 +34,7 @@ pub struct KeyObject {
     pub label: Vec<u8>,
     pub ext_id: Vec<u8>,
     pub public: [u8; 32],
+    pub usage: KeyUsage,
 }
 
 pub fn handle(key: u32, half: Half) -> CK_OBJECT_HANDLE {
@@ -66,6 +68,10 @@ fn bool_(v: bool) -> Attr {
 }
 
 impl KeyObject {
+    pub fn can_sign_raw(&self) -> bool {
+        self.usage == KeyUsage::General
+    }
+
     /// `CKA_ID`: the caller-supplied ID, or the HSM key ID if none was given.
     pub fn ck_id(&self) -> Vec<u8> {
         if self.ext_id.is_empty() {
@@ -92,7 +98,10 @@ impl KeyObject {
             CKA_KEY_TYPE => ulong(CKK_EC_EDWARDS),
             CKA_LOCAL => bool_(true),
             CKA_KEY_GEN_MECHANISM => ulong(CKM_EC_EDWARDS_KEY_PAIR_GEN),
-            CKA_ALLOWED_MECHANISMS => ulong(CKM_EDDSA),
+            // Agent keys sign only HSM-built statements (via quorum-cli), so
+            // they offer no PKCS#11 signing mechanism at all.
+            CKA_ALLOWED_MECHANISMS if self.can_sign_raw() => ulong(CKM_EDDSA),
+            CKA_ALLOWED_MECHANISMS => Attr::Value(Vec::new()),
             CKA_DERIVE | CKA_ENCRYPT | CKA_DECRYPT | CKA_WRAP | CKA_UNWRAP => bool_(false),
             CKA_EC_PARAMS => Attr::Value(ED25519_OID.to_vec()),
             // Public half only.
@@ -106,7 +115,7 @@ impl KeyObject {
                 Attr::Value(v)
             }
             // Private half only.
-            CKA_SIGN if private => bool_(true),
+            CKA_SIGN if private => bool_(self.can_sign_raw()),
             CKA_SIGN_RECOVER if private => bool_(false),
             CKA_SENSITIVE | CKA_ALWAYS_SENSITIVE | CKA_NEVER_EXTRACTABLE if private => bool_(true),
             CKA_EXTRACTABLE | CKA_ALWAYS_AUTHENTICATE | CKA_WRAP_WITH_TRUSTED if private => {

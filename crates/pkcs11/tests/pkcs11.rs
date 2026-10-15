@@ -328,3 +328,44 @@ fn unsupported_functions_fail_cleanly() {
     let rv = unsafe { t.f.C_EncryptInit.unwrap()(s, ptr::null_mut(), 0) };
     assert_eq!(rv, CKR_FUNCTION_NOT_SUPPORTED);
 }
+
+#[test]
+fn agent_keys_are_visible_but_cannot_sign_through_pkcs11() {
+    use quorum_core::agent::{ActionKind, Policy};
+    use quorum_core::wire::{Request, Status, resp};
+
+    let t = Token::new("agent");
+    // Create an agent key the way quorum-cli does, straight over the socket.
+    let mut c = quorum_client::Client::connect().unwrap();
+    assert_eq!(c.call(&Request::Login { pin: PIN }).unwrap().0, Status::Ok);
+    let policy = Policy {
+        allowed: ActionKind::Payment.bit(),
+        max_amount: 100,
+        budget: 100,
+        confirm_above: 100,
+        always_confirm: 0,
+        confirmer: None,
+    };
+    let (status, payload) = c
+        .call(&Request::GenerateAgentKey {
+            label: b"agent",
+            ext_id: b"",
+            policy,
+        })
+        .unwrap();
+    assert_eq!(status, Status::Ok);
+    let key = resp::Generated::decode(&payload).unwrap().key;
+
+    let s = t.open(false);
+    assert_eq!(t.login(s, PIN), CKR_OK);
+    let found = t.find(s, &mut [attr(CKA_LABEL, b"agent")]);
+    assert_eq!(found.len(), 2);
+    let privh = (key as CK_OBJECT_HANDLE) << 1 | 1;
+    assert!(found.contains(&privh));
+    assert_eq!(t.get(s, privh, CKA_SIGN).unwrap(), vec![CK_FALSE]);
+    assert!(t.get(s, privh, CKA_ALLOWED_MECHANISMS).unwrap().is_empty());
+    assert_eq!(
+        t.sign(s, privh, b"forged"),
+        Err(CKR_KEY_FUNCTION_NOT_PERMITTED)
+    );
+}

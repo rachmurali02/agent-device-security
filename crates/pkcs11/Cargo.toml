@@ -12,7 +12,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 cryptoki-sys = "0.5.0"
 ed25519-dalek = "2"
+quorum-client = { path = "../client" }
 quorum-core = { path = "../core" }
 
 [dev-dependencies]
 quorum-emulator = { path = "../emulator" }
+quorum-client = { path = "../client" }

@@ -5,7 +5,6 @@
 //! over a Unix socket; set `QUORUM_HSM_SOCKET` to choose which one.
 
 mod api;
-mod client;
 mod function_list;
 mod objects;
 
