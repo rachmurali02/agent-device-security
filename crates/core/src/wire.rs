@@ -795,8 +795,9 @@ pub mod resp {
 
         pub fn entries(&self) -> impl Iterator<Item = &'a [u8; crate::audit::ENTRY_LEN]> {
             self.entries
-                .chunks_exact(crate::audit::ENTRY_LEN)
-                .filter_map(|c| c.try_into().ok())
+                .as_chunks::<{ crate::audit::ENTRY_LEN }>()
+                .0
+                .iter()
         }
     }
 

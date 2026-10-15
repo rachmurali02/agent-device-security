@@ -922,10 +922,7 @@ fn read_log(path: &Path) -> Result<Vec<[u8; ENTRY_LEN]>> {
     if data.len() % ENTRY_LEN != 0 {
         return Err(format!("{}: not an audit log file", path.display()));
     }
-    Ok(data
-        .chunks_exact(ENTRY_LEN)
-        .filter_map(|c| c.try_into().ok())
-        .collect())
+    Ok(data.as_chunks::<ENTRY_LEN>().0.to_vec())
 }
 
 /// Copies new entries out, makes sure they are on disk, and only then lets

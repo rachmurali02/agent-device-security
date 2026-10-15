@@ -1,0 +1,6 @@
+# Pinned so local builds and CI use the same compiler and lints. A new Rust
+# release once broke CI with a new lint; upgrade this on purpose instead.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+targets = ["thumbv8m.main-none-eabihf"]
