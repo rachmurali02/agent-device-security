@@ -1,0 +1,202 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 628" width="960" height="628" role="img" aria-label="Benchmark comparison of quorum-hsm and SoftHSM2">
+<style>
+  svg { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .bg { fill: #fcfcfb; }
+  .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; }
+  .grid { stroke: #e1e0d9; stroke-width: 1; }
+  .baseline { stroke: #c3c2b7; stroke-width: 1; }
+  .range { stroke: #52514e; stroke-width: 1.25; }
+  .t-h1 { fill: #0b0b0b; font-size: 20px; font-weight: 600; }
+  .t-title { fill: #0b0b0b; font-size: 14px; font-weight: 600; }
+  .t-sub, .t-legend { fill: #52514e; font-size: 12px; }
+  .t-label { fill: #0b0b0b; font-size: 12px; }
+  .t-value { fill: #0b0b0b; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .t-axis { fill: #898781; font-size: 11px; font-variant-numeric: tabular-nums; }
+  .t-note { fill: #52514e; font-size: 11px; font-style: italic; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #1a1a19; }
+    .s1 { fill: #3987e5; } .s2 { fill: #d95926; }
+    .grid { stroke: #2c2c2a; }
+    .baseline { stroke: #383835; }
+    .range { stroke: #c3c2b7; }
+    .t-h1, .t-title, .t-label, .t-value { fill: #f0efec; }
+    .t-sub, .t-legend, .t-note { fill: #c3c2b7; }
+  }
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="t-h1" x="24" y="34">quorum-hsm vs SoftHSM2</text>
+<text class="t-sub" x="24" y="54">Same Ed25519 workload through the same PKCS#11 code. Bars: median of 3 runs; thin line: fastest to slowest run.</text>
+<rect class="s1" x="24" y="66" width="12" height="12" rx="3"/>
+<text class="t-legend" x="42" y="76">quorum-hsm: rules enforced inside the HSM</text>
+<rect class="s2" x="354" y="66" width="12" height="12" rx="3"/>
+<text class="t-legend" x="372" y="76">SoftHSM2: the usual setup, rules checked on the computer</text>
+<text class="t-title" x="24" y="114">Sign a message</text>
+<text class="t-sub" x="24" y="132">Median time in µs, lower is better</text>
+<line class="grid" x1="174.0" y1="146" x2="174.0" y2="198"/>
+<text class="t-axis" x="174.0" y="212" text-anchor="middle">0</text>
+<line class="grid" x1="218.0" y1="146" x2="218.0" y2="198"/>
+<text class="t-axis" x="218.0" y="212" text-anchor="middle">50</text>
+<line class="grid" x1="262.0" y1="146" x2="262.0" y2="198"/>
+<text class="t-axis" x="262.0" y="212" text-anchor="middle">100</text>
+<line class="grid" x1="306.0" y1="146" x2="306.0" y2="198"/>
+<text class="t-axis" x="306.0" y="212" text-anchor="middle">150</text>
+<line class="grid" x1="350.0" y1="146" x2="350.0" y2="198"/>
+<text class="t-axis" x="350.0" y="212" text-anchor="middle">200</text>
+<line class="grid" x1="394.0" y1="146" x2="394.0" y2="198"/>
+<text class="t-axis" x="394.0" y="212" text-anchor="middle">250</text>
+<line class="baseline" x1="174" y1="146" x2="174" y2="198"/>
+<text class="t-label" x="166" y="162" text-anchor="end">quorum-hsm</text>
+<path class="s1" d="M174.0,150.0 h97.6 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-97.6 z"><title>quorum-hsm: 115 µs (runs: 108 µs to 118 µs)</title></path>
+<line class="range" x1="269.3" y1="158.0" x2="277.4" y2="158.0"/>
+<line class="range" x1="269.3" y1="154.0" x2="269.3" y2="162.0"/>
+<line class="range" x1="277.4" y1="154.0" x2="277.4" y2="162.0"/>
+<text class="t-value" x="283.4" y="162">115 µs</text>
+<text class="t-label" x="166" y="190" text-anchor="end">SoftHSM2</text>
+<path class="s2" d="M174.0,178.0 h173.3 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-173.3 z"><title>SoftHSM2: 202 µs (runs: 196 µs to 206 µs)</title></path>
+<line class="range" x1="346.7" y1="186.0" x2="355.4" y2="186.0"/>
+<line class="range" x1="346.7" y1="182.0" x2="346.7" y2="190.0"/>
+<line class="range" x1="355.4" y1="182.0" x2="355.4" y2="190.0"/>
+<text class="t-value" x="361.4" y="190">202 µs</text>
+<text class="t-title" x="512" y="114">Approve one agent action, saved safely</text>
+<text class="t-sub" x="512" y="132">Median time in µs, lower is better</text>
+<line class="grid" x1="662.0" y1="146" x2="662.0" y2="198"/>
+<text class="t-axis" x="662.0" y="212" text-anchor="middle">0</text>
+<line class="grid" x1="706.0" y1="146" x2="706.0" y2="198"/>
+<text class="t-axis" x="706.0" y="212" text-anchor="middle">200</text>
+<line class="grid" x1="750.0" y1="146" x2="750.0" y2="198"/>
+<text class="t-axis" x="750.0" y="212" text-anchor="middle">400</text>
+<line class="grid" x1="794.0" y1="146" x2="794.0" y2="198"/>
+<text class="t-axis" x="794.0" y="212" text-anchor="middle">600</text>
+<line class="grid" x1="838.0" y1="146" x2="838.0" y2="198"/>
+<text class="t-axis" x="838.0" y="212" text-anchor="middle">800</text>
+<line class="grid" x1="882.0" y1="146" x2="882.0" y2="198"/>
+<text class="t-axis" x="882.0" y="212" text-anchor="middle">1,000</text>
+<line class="baseline" x1="662" y1="146" x2="662" y2="198"/>
+<text class="t-label" x="654" y="162" text-anchor="end">quorum-hsm</text>
+<path class="s1" d="M662.0,150.0 h156.4 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-156.4 z"><title>quorum-hsm: 729 µs (runs: 710 µs to 746 µs)</title></path>
+<line class="range" x1="818.2" y1="158.0" x2="826.2" y2="158.0"/>
+<line class="range" x1="818.2" y1="154.0" x2="818.2" y2="162.0"/>
+<line class="range" x1="826.2" y1="154.0" x2="826.2" y2="162.0"/>
+<text class="t-value" x="832.2" y="162">729 µs</text>
+<text class="t-label" x="654" y="190" text-anchor="end">SoftHSM2</text>
+<path class="s2" d="M662.0,178.0 h98.9 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-98.9 z"><title>SoftHSM2: 468 µs (runs: 450 µs to 485 µs)</title></path>
+<line class="range" x1="761.1" y1="186.0" x2="768.8" y2="186.0"/>
+<line class="range" x1="761.1" y1="182.0" x2="761.1" y2="190.0"/>
+<line class="range" x1="768.8" y1="182.0" x2="768.8" y2="190.0"/>
+<text class="t-value" x="774.8" y="190">468 µs</text>
+<text class="t-note" x="512" y="234">SoftHSM2 is faster, but its rule check runs on the computer and can be skipped.</text>
+<text class="t-title" x="24" y="278">Create a key</text>
+<text class="t-sub" x="24" y="296">Median time in ms, lower is better</text>
+<line class="grid" x1="174.0" y1="310" x2="174.0" y2="362"/>
+<text class="t-axis" x="174.0" y="376" text-anchor="middle">0</text>
+<line class="grid" x1="229.0" y1="310" x2="229.0" y2="362"/>
+<text class="t-axis" x="229.0" y="376" text-anchor="middle">5</text>
+<line class="grid" x1="284.0" y1="310" x2="284.0" y2="362"/>
+<text class="t-axis" x="284.0" y="376" text-anchor="middle">10</text>
+<line class="grid" x1="339.0" y1="310" x2="339.0" y2="362"/>
+<text class="t-axis" x="339.0" y="376" text-anchor="middle">15</text>
+<line class="grid" x1="394.0" y1="310" x2="394.0" y2="362"/>
+<text class="t-axis" x="394.0" y="376" text-anchor="middle">20</text>
+<line class="baseline" x1="174" y1="310" x2="174" y2="362"/>
+<text class="t-label" x="166" y="326" text-anchor="end">quorum-hsm</text>
+<path class="s1" d="M174.0,314.0 h14.4 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-14.4 z"><title>quorum-hsm: 1.7 ms (runs: 1.3 ms to 2.2 ms)</title></path>
+<line class="range" x1="188.2" y1="322.0" x2="197.8" y2="322.0"/>
+<line class="range" x1="188.2" y1="318.0" x2="188.2" y2="326.0"/>
+<line class="range" x1="197.8" y1="318.0" x2="197.8" y2="326.0"/>
+<text class="t-value" x="203.8" y="326">1.7 ms</text>
+<text class="t-label" x="166" y="354" text-anchor="end">SoftHSM2</text>
+<path class="s2" d="M174.0,342.0 h124.6 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-124.6 z"><title>SoftHSM2: 11.7 ms (runs: 11.6 ms to 12.4 ms)</title></path>
+<line class="range" x1="301.8" y1="350.0" x2="310.5" y2="350.0"/>
+<line class="range" x1="301.8" y1="346.0" x2="301.8" y2="354.0"/>
+<line class="range" x1="310.5" y1="346.0" x2="310.5" y2="354.0"/>
+<text class="t-value" x="316.5" y="354">11.7 ms</text>
+<text class="t-title" x="512" y="278">Attacks blocked</text>
+<text class="t-sub" x="512" y="296">Six attacks by someone who controls the computer and knows the PIN</text>
+<line class="grid" x1="662.0" y1="310" x2="662.0" y2="362"/>
+<text class="t-axis" x="662.0" y="376" text-anchor="middle">0</text>
+<line class="grid" x1="735.3" y1="310" x2="735.3" y2="362"/>
+<text class="t-axis" x="735.3" y="376" text-anchor="middle">2</text>
+<line class="grid" x1="808.7" y1="310" x2="808.7" y2="362"/>
+<text class="t-axis" x="808.7" y="376" text-anchor="middle">4</text>
+<line class="grid" x1="882.0" y1="310" x2="882.0" y2="362"/>
+<text class="t-axis" x="882.0" y="376" text-anchor="middle">6</text>
+<line class="baseline" x1="662" y1="310" x2="662" y2="362"/>
+<text class="t-label" x="654" y="326" text-anchor="end">quorum-hsm</text>
+<path class="s1" d="M662.0,314.0 h216.0 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-216.0 z"><title>quorum-hsm: 6 of 6</title></path>
+<text class="t-value" x="888.0" y="326">6 of 6</text>
+<text class="t-label" x="654" y="354" text-anchor="end">SoftHSM2</text>
+<path class="s2" d="M662.0,342.0 h32.7 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-32.7 z"><title>SoftHSM2: 1 of 6</title></path>
+<text class="t-value" x="704.7" y="354">1 of 6</text>
+<text class="t-note" x="512" y="398">The one SoftHSM2 blocks: reading the private key out.</text>
+<text class="t-title" x="24" y="442">Signatures per second</text>
+<text class="t-sub" x="24" y="460">Higher is better</text>
+<line class="grid" x1="174.0" y1="474" x2="174.0" y2="562"/>
+<text class="t-axis" x="174.0" y="576" text-anchor="middle">0</text>
+<line class="grid" x1="218.0" y1="474" x2="218.0" y2="562"/>
+<text class="t-axis" x="218.0" y="576" text-anchor="middle">2,000</text>
+<line class="grid" x1="262.0" y1="474" x2="262.0" y2="562"/>
+<text class="t-axis" x="262.0" y="576" text-anchor="middle">4,000</text>
+<line class="grid" x1="306.0" y1="474" x2="306.0" y2="562"/>
+<text class="t-axis" x="306.0" y="576" text-anchor="middle">6,000</text>
+<line class="grid" x1="350.0" y1="474" x2="350.0" y2="562"/>
+<text class="t-axis" x="350.0" y="576" text-anchor="middle">8,000</text>
+<line class="grid" x1="394.0" y1="474" x2="394.0" y2="562"/>
+<text class="t-axis" x="394.0" y="576" text-anchor="middle">10,000</text>
+<line class="baseline" x1="174" y1="474" x2="174" y2="562"/>
+<text class="t-label" x="166" y="499.0" text-anchor="end">1 thread</text>
+<path class="s1" d="M174.0,478.0 h170.4 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-170.4 z"><title>quorum-hsm: 7,929 (runs: 6,809 to 7,995)</title></path>
+<line class="range" x1="323.8" y1="486.0" x2="349.9" y2="486.0"/>
+<line class="range" x1="323.8" y1="482.0" x2="323.8" y2="490.0"/>
+<line class="range" x1="349.9" y1="482.0" x2="349.9" y2="490.0"/>
+<text class="t-value" x="355.9" y="490">7,929</text>
+<path class="s2" d="M174.0,496.0 h100.2 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-100.2 z"><title>SoftHSM2: 4,736 (runs: 4,645 to 4,766)</title></path>
+<line class="range" x1="276.2" y1="504.0" x2="278.9" y2="504.0"/>
+<line class="range" x1="276.2" y1="500.0" x2="276.2" y2="508.0"/>
+<line class="range" x1="278.9" y1="500.0" x2="278.9" y2="508.0"/>
+<text class="t-value" x="284.9" y="508">4,736</text>
+<text class="t-label" x="166" y="545.0" text-anchor="end">4 threads</text>
+<path class="s1" d="M174.0,524.0 h138.8 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-138.8 z"><title>quorum-hsm: 6,490 (runs: 6,490 to 7,230)</title></path>
+<line class="range" x1="316.8" y1="532.0" x2="333.1" y2="532.0"/>
+<line class="range" x1="316.8" y1="528.0" x2="316.8" y2="536.0"/>
+<line class="range" x1="333.1" y1="528.0" x2="333.1" y2="536.0"/>
+<text class="t-value" x="339.1" y="536">6,490</text>
+<path class="s2" d="M174.0,542.0 h184.4 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-184.4 z"><title>SoftHSM2: 8,565 (runs: 7,051 to 9,080)</title></path>
+<line class="range" x1="329.1" y1="550.0" x2="373.8" y2="550.0"/>
+<line class="range" x1="329.1" y1="546.0" x2="329.1" y2="554.0"/>
+<line class="range" x1="373.8" y1="546.0" x2="373.8" y2="554.0"/>
+<text class="t-value" x="379.8" y="554">8,565</text>
+<text class="t-note" x="24" y="598">Our emulator does one command at a time, like a single-core chip.</text>
+<text class="t-title" x="512" y="442">Where an agent action&#x27;s time goes (quorum-hsm)</text>
+<text class="t-sub" x="512" y="460">Median time in µs; the rule check itself is a small part</text>
+<line class="grid" x1="662.0" y1="474" x2="662.0" y2="554"/>
+<text class="t-axis" x="662.0" y="568" text-anchor="middle">0</text>
+<line class="grid" x1="706.0" y1="474" x2="706.0" y2="554"/>
+<text class="t-axis" x="706.0" y="568" text-anchor="middle">200</text>
+<line class="grid" x1="750.0" y1="474" x2="750.0" y2="554"/>
+<text class="t-axis" x="750.0" y="568" text-anchor="middle">400</text>
+<line class="grid" x1="794.0" y1="474" x2="794.0" y2="554"/>
+<text class="t-axis" x="794.0" y="568" text-anchor="middle">600</text>
+<line class="grid" x1="838.0" y1="474" x2="838.0" y2="554"/>
+<text class="t-axis" x="838.0" y="568" text-anchor="middle">800</text>
+<line class="grid" x1="882.0" y1="474" x2="882.0" y2="554"/>
+<text class="t-axis" x="882.0" y="568" text-anchor="middle">1,000</text>
+<line class="baseline" x1="662" y1="474" x2="662" y2="554"/>
+<text class="t-label" x="654" y="490" text-anchor="end">Rule check + signing only</text>
+<path class="s1" d="M662.0,478.0 h7.7 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-7.7 z"><title>quorum-hsm: 53 µs (runs: 53 µs to 53 µs)</title></path>
+<line class="range" x1="673.7" y1="486.0" x2="673.7" y2="486.0"/>
+<line class="range" x1="673.7" y1="482.0" x2="673.7" y2="490.0"/>
+<line class="range" x1="673.7" y1="482.0" x2="673.7" y2="490.0"/>
+<text class="t-value" x="679.7" y="490">53 µs</text>
+<text class="t-label" x="654" y="518" text-anchor="end">+ socket and file write</text>
+<path class="s1" d="M662.0,506.0 h56.9 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-56.9 z"><title>quorum-hsm: 277 µs (runs: 265 µs to 281 µs)</title></path>
+<line class="range" x1="720.3" y1="514.0" x2="723.8" y2="514.0"/>
+<line class="range" x1="720.3" y1="510.0" x2="720.3" y2="518.0"/>
+<line class="range" x1="723.8" y1="510.0" x2="723.8" y2="518.0"/>
+<text class="t-value" x="729.8" y="518">277 µs</text>
+<text class="t-label" x="654" y="546" text-anchor="end">+ waiting for the disk</text>
+<path class="s1" d="M662.0,534.0 h156.4 a4,4 0 0 1 4,4 v8.0 a4,4 0 0 1 -4,4 h-156.4 z"><title>quorum-hsm: 729 µs (runs: 710 µs to 746 µs)</title></path>
+<line class="range" x1="818.2" y1="542.0" x2="826.2" y2="542.0"/>
+<line class="range" x1="818.2" y1="538.0" x2="818.2" y2="546.0"/>
+<line class="range" x1="826.2" y1="538.0" x2="826.2" y2="546.0"/>
+<text class="t-value" x="832.2" y="546">729 µs</text>
+<text class="t-note" x="512" y="590">Most of the cost is making sure a power cut can&#x27;t lose a counted payment.</text></svg>

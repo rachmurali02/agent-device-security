@@ -1,0 +1,23 @@
+1. Signing a 64-byte message (raw signing)	No HSM: Ed25519 in the same process (floor)	17.16	46.34	51777.5
+1. Signing a 64-byte message (raw signing)	quorum-hsm core, in process (no socket)	33.11	55.60	28886.2
+1. Signing a 64-byte message (raw signing)	quorum-hsm emulator via PKCS#11	115.43	245.32	8064.5
+1. Signing a 64-byte message (raw signing)	SoftHSM2 via PKCS#11	206.09	422.63	4300.6
+2. Creating keys	quorum-hsm: general key via PKCS#11 (fsync)	2166.79	3237.84	441.2
+2. Creating keys	quorum-hsm: agent key with 2-of-3 admin sign-off + birth certificate (create + delete pair)	2889.69	3418.75	349.1
+2. Creating keys	SoftHSM2: key via PKCS#11	12406.97	18053.18	76.4
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm core, in process (no socket, no disk)	53.00	83.55	17983.7
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, spending saved with fsync (safe default)	710.19	1906.91	1325.0
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, fsync off (unsafe; shows cost of durability)	264.79	704.38	3362.0
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, with the user's confirmation (challenge + phone + approve)	953.45	2241.97	980.5
+3. Approving one agent action ("pay $0.01 to shop.example")	SoftHSM2 + rules on the host, counters in memory only	206.97	363.40	4561.7
+3. Approving one agent action ("pay $0.01 to shop.example")	SoftHSM2 + rules on the host, counters saved with fsync	485.23	1703.29	1259.8
+3. Approving one agent action ("pay $0.01 to shop.example")	Receiver check: HSM identity -> certificate -> signed action	127.62	215.02	7281.2
+threads	quorum-hsm emulator: raw signing via PKCS#11	6808.7	7230.0
+threads	SoftHSM2: raw signing via PKCS#11	4736.5	8565.1
+threads	quorum-hsm emulator: agent actions (fsync), one connection per thread	1263.0	1231.8
+attack	Get a signature for a payment the rules forbid ($9,999.99)	1	0
+attack	Spend past the budget ($3 budget, ten $1 payments)	1	0
+attack	Create a new signing key with loose rules, using only the PIN	1	0
+attack	Reset the budget by deleting and re-creating the key	1	0
+attack	Read the private key out of the HSM	1	1
+attack	Pass off a signature as approved under rules it wasn't (receiver's view)	1	0

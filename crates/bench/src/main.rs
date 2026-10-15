@@ -50,6 +50,20 @@ struct Config {
     quorum_module: PathBuf,
     softhsm_module: PathBuf,
     out: Option<PathBuf>,
+    /// Raw numbers as tab-separated values, for charts (`tools/plot_benchmarks.py`).
+    data: Option<PathBuf>,
+}
+
+/// Raw results, one tab-separated row per measurement:
+/// `section, option, p50_us, p99_us, ops_per_sec` (latency tables),
+/// `threads, option, ops_1_thread, ops_n_threads` (throughput), and
+/// `attack, name, quorum_blocked, softhsm_blocked` (security).
+static DATA: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn record(fields: &[&str]) {
+    let mut d = DATA.lock().unwrap();
+    d.push_str(&fields.join("\t"));
+    d.push('\n');
 }
 
 fn parse_args() -> Config {
@@ -71,6 +85,7 @@ fn parse_args() -> Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/usr/lib/softhsm/libsofthsm2.so")),
         out: get("--out").map(PathBuf::from),
+        data: get("--data").map(PathBuf::from),
     }
 }
 
@@ -152,6 +167,13 @@ fn table(out: &mut String, title: &str, rows: &[Stats]) {
     .unwrap();
     writeln!(out, "|---|---:|---:|---:|").unwrap();
     for r in rows {
+        record(&[
+            title,
+            &r.name,
+            &format!("{:.2}", r.p50.as_secs_f64() * 1e6),
+            &format!("{:.2}", r.p99.as_secs_f64() * 1e6),
+            &format!("{:.1}", r.ops_per_sec),
+        ]);
         writeln!(
             out,
             "| {} | {} | {} | {:.0} |",
@@ -508,6 +530,10 @@ fn main() {
     if let Some(out) = &cfg.out {
         fs::write(out, &report).unwrap();
         eprintln!("results written to {}", out.display());
+    }
+    if let Some(data) = &cfg.data {
+        fs::write(data, &*DATA.lock().unwrap()).unwrap();
+        eprintln!("raw numbers written to {}", data.display());
     }
     let _ = fs::remove_dir_all(&dir);
     if !held {
@@ -915,6 +941,7 @@ fn concurrency(out: &mut String, cfg: &Config, safe: &Emulator, have_softhsm: bo
             }
         });
         writeln!(out, "| {name} | {one:.0} | {many:.0} |").unwrap();
+        record(&["threads", name, &format!("{one:.1}"), &format!("{many:.1}")]);
         drop(s);
         p.finalize().ok();
     };
@@ -947,6 +974,12 @@ fn concurrency(out: &mut String, cfg: &Config, safe: &Emulator, have_softhsm: bo
         "| quorum-hsm emulator: agent actions (fsync), one connection per thread | {one:.0} | {many:.0} |"
     )
     .unwrap();
+    record(&[
+        "threads",
+        "quorum-hsm emulator: agent actions (fsync), one connection per thread",
+        &format!("{one:.1}"),
+        &format!("{many:.1}"),
+    ]);
 }
 
 /// Each attack is run for real against each option.
@@ -967,6 +1000,16 @@ fn attacks(out: &mut String, cfg: &Config, safe: &Emulator, have_softhsm: bool) 
     let mut row = |out: &mut String, attack: &str, q: String, s: String| {
         quorum_held &= q.starts_with('✅');
         writeln!(out, "| {attack} | {q} | {s} |").unwrap();
+        let held = |c: &str| {
+            if c.starts_with('✅') {
+                "1"
+            } else if c.starts_with('❌') {
+                "0"
+            } else {
+                ""
+            }
+        };
+        record(&["attack", attack, held(&q), held(&s)]);
     };
     let blocked = |how: &str| format!("✅ blocked ({how})");
     let works = |how: &str| format!("❌ attack works ({how})");

@@ -283,12 +283,14 @@ PKCS#11 code. It measures speed, then **actually runs six attacks** against
 each. The full report, with what the numbers mean, is in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
+![Benchmark comparison chart of quorum-hsm and SoftHSM2](docs/benchmarks/comparison.svg)
+
 | | quorum-hsm (rules inside the HSM) | SoftHSM2 (rules on the computer) |
 |---|---|---|
 | Attacks blocked | **6 of 6** | 1 of 6 |
-| Sign a message | ~110 µs | ~195 µs |
-| Approve an agent action, saved safely | ~0.8 ms | ~0.5 ms (but an attacker can skip the rules) |
-| Create a key | ~1.4 ms | ~10–15 ms |
+| Sign a message | ~115 µs | ~200 µs |
+| Approve an agent action, saved safely | ~0.73 ms | ~0.47 ms (but an attacker can skip the rules) |
+| Create a key | ~1.7 ms | ~12 ms |
 
 **What we learned:**
 

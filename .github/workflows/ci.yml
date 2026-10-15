@@ -22,4 +22,4 @@ jobs:
       - run: ./scripts/demo.sh
       - run: ./scripts/demo-agent.sh
       - name: Benchmark smoke test (small run; checks the harness and attacks still work)
-        run: cargo build --release -p quorum-bench && target/release/quorum-bench --iterations 50
+        run: cargo build --release -p quorum-bench && target/release/quorum-bench --iterations 50 --data /tmp/run.tsv && tools/plot_benchmarks.py /tmp/run.tsv > /dev/null

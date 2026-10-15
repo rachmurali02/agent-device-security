@@ -2,9 +2,14 @@
 
 **Short answer:** yes, for our threat (someone controls the computer and knows
 the PIN). It's the only option tested that blocks the attacks. It costs about
-**0.3–0.6 milliseconds more per agent action** than the conventional setup on
+**0.3–0.5 milliseconds more per agent action** than the conventional setup on
 this machine, and almost all of that is *saving to disk safely*, not the rules
 themselves.
+
+![Benchmark comparison chart of quorum-hsm and SoftHSM2](benchmarks/comparison.svg)
+
+*Bars show the median of three runs; the thin line spans the fastest to
+slowest run. The same numbers are in the tables below.*
 
 ## What we compared
 
@@ -30,7 +35,10 @@ To keep the comparison fair:
 ./scripts/bench.sh                      # needs softhsm2 (sudo apt install softhsm2)
 ```
 
-This writes [`docs/benchmarks/results.md`](benchmarks/results.md). To test
+This runs the benchmark three times, then writes the report
+([`docs/benchmarks/results.md`](benchmarks/results.md)), the raw numbers
+([`docs/benchmarks/runs/`](benchmarks/runs/)) and the chart
+([`docs/benchmarks/comparison.svg`](benchmarks/comparison.svg)). To test
 another HSM, such as a real YubiHSM 2, point the benchmark at its PKCS#11 library:
 
 ```bash
@@ -41,21 +49,23 @@ target/release/quorum-bench --softhsm /path/to/other_pkcs11.so
 
 Machine: Intel Xeon @ 2.10GHz, 4 cores, cloud VM. "Median" is the typical
 time for one operation. We ran the benchmark three times; the ranges below
-cover all three runs (numbers moved by about ±15% between runs). Full output
-from one run: [`benchmarks/results.md`](benchmarks/results.md).
+cover all three runs (most numbers moved by about ±10% between runs; key
+creation moved more). Full output from one run:
+[`benchmarks/results.md`](benchmarks/results.md); raw numbers from all three:
+[`benchmarks/runs/`](benchmarks/runs/).
 
 ### Speed
 
 | What | quorum-hsm | SoftHSM2 | No HSM |
 |---|---:|---:|---:|
-| Sign a message (median) | **106–122 µs** | 191–201 µs | 17 µs |
-| Create a key (median) | **1.4 ms** | 10–15 ms | n/a |
-| Approve an agent action, saved safely to disk | 750–850 µs | 420–570 µs ¹ | n/a |
-| Approve an agent action, *not* saved safely (unsafe) | 363 µs | 211–246 µs ¹ | n/a |
-| Approve an action that needs the user's OK | 1.0 ms | not possible ² | n/a |
-| Create an agent key with 2-of-3 admin sign-off + certificate, then delete it | 2.5 ms | not possible ² | n/a |
-| Receiver checks a signed action (no HSM needed) | 125 µs | n/a | n/a |
-| Signatures per second, 1 thread → 4 threads | ~7,500 → ~6,200 | ~4,500 → ~7,900 | n/a |
+| Sign a message (median) | **108–118 µs** | 196–206 µs | 17 µs |
+| Create a key (median) | **1.3–2.2 ms** | 11.6–12.4 ms | n/a |
+| Approve an agent action, saved safely to disk | 710–746 µs | 450–485 µs ¹ | n/a |
+| Approve an agent action, *not* saved safely (unsafe) | 265–281 µs | 203–209 µs ¹ | n/a |
+| Approve an action that needs the user's OK | 0.91–0.95 ms | not possible ² | n/a |
+| Create an agent key with 2-of-3 admin sign-off + certificate, then delete it | 2.1–2.9 ms | not possible ² | n/a |
+| Receiver checks a signed action (no HSM needed) | 128–142 µs | n/a | n/a |
+| Signatures per second, 1 thread → 4 threads | ~7,900 → ~6,500 | ~4,700 → ~8,600 | n/a |
 
 ¹ The rules run on the computer, so these are the steps an attacker can skip (see below).
 ² SoftHSM2 has no way to do this inside the HSM.
@@ -84,7 +94,7 @@ SoftHSM2 still protects the key itself; it just signs whatever it's asked to.
    checking every rule and building the statement adds about **20 µs**.
 
 2. **Saving safely to disk is the real cost.** An agent action takes about
-   360 µs without waiting for the disk and 750–850 µs with it. Waiting is
+   280 µs without waiting for the disk and 710–750 µs with it. Waiting is
    what guarantees a power cut can't hand out a free signature, so it's not
    optional. The conventional setup pays for this too *if* it saves its
    counters carefully, and it can still be cheated (see the security table).
@@ -96,7 +106,7 @@ SoftHSM2 still protects the key itself; it just signs whatever it's asked to.
    up (in secure chips or eMMC "RPMB" storage) would do the same job.
 
 4. **Crossing into the HSM costs more than the maths.** A signature takes
-   17 µs on its own but 106–122 µs through PKCS#11 and the socket. Our
+   17 µs on its own but 108–118 µs through PKCS#11 and the socket. Our
    adapter also asks the HSM for its key list before every signature: one
    extra round trip that a small cache would remove.
 
@@ -106,7 +116,7 @@ SoftHSM2 still protects the key itself; it just signs whatever it's asked to.
    hardware the chip would be the limit anyway, but it matters if this were
    a busy server.
 
-6. **Key creation is faster here** (1.4 ms against 10–15 ms), mostly because
+6. **Key creation is faster here** (1.3–2.2 ms against about 12 ms), mostly because
    SoftHSM2 encrypts and writes a separate file for every key.
 
 ## Other kinds of HSM
@@ -146,4 +156,4 @@ real hardware is the way to fill in the speed column for these.
   secure chips are much slower at the maths, so these numbers show
   *relative* costs, not real-hardware speed.
 - Disk speed decides the "saved safely" rows, and cloud disks vary.
-- One machine, three runs. Treat differences under ~15% as noise.
+- One machine, three runs. Treat differences under ~10–15% as noise.
