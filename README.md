@@ -14,9 +14,11 @@ See [`docs/IDEAS.md`](docs/IDEAS.md) for the project roadmap.
 ## Planned layout
 
 ```
-hsm/          PKCS#11-backed signing service (SoftHSM2 for dev)
-attest/       device + model attestation (TPM/vTPM quotes, measured inference)
-tokens/       device-bound, attenuable capability tokens for agent tool calls
-provision/    factory provisioning simulator (device identity, CA, revocation)
-docs/         design notes and threat models
+core/         no_std Rust trusted core: keys, mechanisms, policy engine, counters, audit log
+emulator/     host-side HSM emulator running the core over a framed transport
+pkcs11/       PKCS#11 v3 provider (cdylib) incl. vendor agent-action mechanism
+tools/        admin CLI: policy bundles, quorum signing, audit verification
+fuzz/         cargo-fuzz targets + fault-injection harness
+firmware/     RP2350 (TrustZone-M) port and secure bootloader
+docs/         design notes, threat model, key ceremony
 ```
