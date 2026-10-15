@@ -50,7 +50,7 @@ Runs first on a host emulator, then on real hardware (see below).
 - QEMU + OP-TEE for TrustZone-A without hardware
 
 ## Milestones
-1. Emulator: key store + Ed25519 signing + PKCS#11 provider passing `pkcs11-tool` tests
+1. ✅ Emulator: key store + Ed25519 signing + PKCS#11 provider passing `pkcs11-tool` tests
 2. Structured agent-action parsing + signed policy + monotonic counters
 3. Quorum policy updates, audit hash chain, policy attestation
 4. Fuzzing + fault-injection harness, threat model (`docs/THREAT_MODEL.md`)
