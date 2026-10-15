@@ -45,9 +45,7 @@ impl Token {
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("hsm.sock");
 
-        let mut storage = FileStorage {
-            path: dir.join("hsm.state"),
-        };
+        let mut storage = FileStorage::new(dir.join("hsm.state"));
         let hsm = Hsm::provision(
             Provisioning {
                 serial: *SERIAL_NO,

@@ -20,6 +20,16 @@ use rand_core::OsRng;
 /// state, fsync the directory. A crash leaves either the old or new state.
 pub struct FileStorage {
     pub path: PathBuf,
+    /// Wait for the disk to confirm every write (fsync). Turning this off is
+    /// only for measuring what durability costs: a power cut could then lose
+    /// a counter update, which is exactly what the HSM must never allow.
+    pub sync: bool,
+}
+
+impl FileStorage {
+    pub fn new(path: PathBuf) -> Self {
+        FileStorage { path, sync: true }
+    }
 }
 
 impl FileStorage {
@@ -32,8 +42,13 @@ impl FileStorage {
             .mode(0o600)
             .open(&tmp)?;
         f.write_all(state)?;
-        f.sync_all()?;
+        if self.sync {
+            f.sync_all()?;
+        }
         fs::rename(&tmp, &self.path)?;
+        if !self.sync {
+            return Ok(());
+        }
         let dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
         File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
     }
@@ -55,13 +70,19 @@ pub struct Device {
 
 /// Accepts connections forever, one thread and one HSM session each.
 pub fn serve(listener: UnixListener, device: Device) {
+    serve_with(listener, device, true)
+}
+
+/// Like `serve`, but `log: false` turns off the per-command log line (used
+/// by the benchmarks, where writing to the terminal would skew timings).
+pub fn serve_with(listener: UnixListener, device: Device, log: bool) {
     let device = Arc::new(Mutex::new(device));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let device = Arc::clone(&device);
                 thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &device)
+                    if let Err(e) = handle_connection(stream, &device, log)
                         && e.kind() != io::ErrorKind::UnexpectedEof
                     {
                         eprintln!("connection error: {e}");
@@ -74,7 +95,11 @@ pub fn serve(listener: UnixListener, device: Device) {
 }
 
 /// One connection = one HSM session. Frames are `[len: u32 LE][frame]`.
-fn handle_connection(mut stream: UnixStream, device: &Mutex<Device>) -> io::Result<()> {
+fn handle_connection(
+    mut stream: UnixStream,
+    device: &Mutex<Device>,
+    log_commands: bool,
+) -> io::Result<()> {
     let mut session = Session::default();
     let mut req = vec![0u8; MAX_FRAME];
     let mut out = vec![0u8; MAX_FRAME];
@@ -96,7 +121,9 @@ fn handle_connection(mut stream: UnixStream, device: &Mutex<Device>) -> io::Resu
             let Device { hsm, storage } = &mut *guard;
             hsm.handle(&mut session, storage, &mut OsRng, &req[..len], &mut out)
         };
-        log(&req[..len], &out[..n]);
+        if log_commands {
+            log(&req[..len], &out[..n]);
+        }
 
         stream.write_all(&(n as u32).to_le_bytes())?;
         stream.write_all(&out[..n])?;

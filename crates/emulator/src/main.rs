@@ -3,7 +3,7 @@
 //! Usage:
 //!   quorum-emulator init  --state <file> --pin <pin>
 //!                         [--admin <pubkey file>]... [--threshold <n>] [--force]
-//!   quorum-emulator serve --state <file> --socket <path>
+//!   quorum-emulator serve --state <file> --socket <path> [--no-fsync]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
 const USAGE: &str = "usage:
   quorum-emulator init  --state <file> --pin <pin>
                         [--admin <pubkey file>]... [--threshold <n>] [--force]
-  quorum-emulator serve --state <file> --socket <path>";
+  quorum-emulator serve --state <file> --socket <path> [--no-fsync]";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -97,7 +97,7 @@ fn init(args: &[String]) -> Result<(), String> {
         None => return Err("--threshold is required with --admin".into()),
     };
 
-    let mut storage = FileStorage { path: path.clone() };
+    let mut storage = FileStorage::new(path.clone());
     let hsm = Hsm::provision(
         Provisioning {
             serial,
@@ -148,12 +148,14 @@ fn serve(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("chmod socket: {e}"))?;
     eprintln!("HSM {serial} listening on {}", socket.display());
 
-    quorum_emulator::serve(
-        listener,
-        Device {
-            hsm,
-            storage: FileStorage { path },
-        },
-    );
+    let mut storage = FileStorage::new(path);
+    // Benchmarking only: see FileStorage::sync.
+    storage.sync = !args.iter().any(|a| a == "--no-fsync");
+    if !storage.sync {
+        eprintln!(
+            "WARNING: --no-fsync: state changes may be lost on power loss (benchmarking only)"
+        );
+    }
+    quorum_emulator::serve(listener, Device { hsm, storage });
     Ok(())
 }

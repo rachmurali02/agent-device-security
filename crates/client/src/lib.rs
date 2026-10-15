@@ -21,8 +21,12 @@ pub struct Client {
 
 impl Client {
     pub fn connect() -> io::Result<Self> {
+        Self::connect_at(&socket_path())
+    }
+
+    pub fn connect_at(path: &std::path::Path) -> io::Result<Self> {
         Ok(Client {
-            stream: UnixStream::connect(socket_path())?,
+            stream: UnixStream::connect(path)?,
         })
     }
 

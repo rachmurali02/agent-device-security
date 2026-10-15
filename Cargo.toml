@@ -5,7 +5,7 @@ members = [
     "crates/emulator",
     "crates/client",
     "crates/pkcs11",
-    "crates/cli",
+    "crates/cli", "crates/bench",
 ]
 
 [workspace.package]
