@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Agent demo: an AI shopping agent whose key is guarded by rules inside the
-# HSM. Creating the key needs sign-off from 2 of 3 admins; every payment
-# answers a shop's one-time request. Needs: cargo, pkcs11-tool (OpenSC).
+# HSM. Creating the key, changing its rules and changing the admins all need
+# sign-off from 2 of 3 admins; every payment answers a shop's one-time
+# request; and everything lands in a tamper-evident audit log.
+# Needs: cargo, pkcs11-tool (OpenSC).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -103,6 +105,60 @@ step "10. Someone edits a signed action afterwards: the check fails"
 cp "$WORK/coffee.statement" "$WORK/edited.statement"; cp "$WORK/coffee.sig" "$WORK/edited.sig"
 printf '\x04' | dd of="$WORK/edited.statement" bs=1 seek=40 conv=notrunc status=none
 expect_denied $Q verify --hsm-identity "$WORK/hsm.id" --cert "$WORK/agent" --signed "$WORK/edited"
+
+step "11. An audit collector copies the HSM's log out (it holds at most 64 entries)"
+$Q audit pull --log "$WORK/audit.log"
+
+step "12. Changing the rules: \$10 per payment from now on, \$100 in total"
+NEW_RULES=(--allow payment,send_message --max-amount 10 --budget 100 --confirm-above 20
+           --confirmer "$WORK/phone.pub" --require-request)
+$Q admin propose-update --key 1 "${NEW_RULES[@]}" --out "$WORK/p3"
+$Q admin approve --proposal "$WORK/p3" --as "$WORK/alice" --yes --out "$WORK/p3.alice"
+echo "   ...with only Alice's approval:"
+expect_denied $Q admin submit --proposal "$WORK/p3" --approval "$WORK/p3.alice"
+$Q admin propose-update --key 1 "${NEW_RULES[@]}" --out "$WORK/p4" >/dev/null
+$Q admin approve --proposal "$WORK/p4" --as "$WORK/alice" --yes --out "$WORK/p4.alice" >/dev/null
+$Q admin approve --proposal "$WORK/p4" --as "$WORK/carol" --yes --out "$WORK/p4.carol"
+$Q admin submit --proposal "$WORK/p4" --approval "$WORK/p4.alice" --approval "$WORK/p4.carol" \
+  --cert-out "$WORK/agent-v2"
+
+step "13. A \$10 payment under the new rules: the shop needs the new certificate"
+$Q shop request --out "$WORK/lunch.req"
+$Q act --key 1 --kind payment --to cafe.example --amount 10 --request "$WORK/lunch.req" --out "$WORK/lunch"
+echo "   ...a shop still holding the old certificate notices the rules changed:"
+expect_denied $Q verify --hsm-identity "$WORK/hsm.id" --cert "$WORK/agent" --signed "$WORK/lunch"
+$Q verify --hsm-identity "$WORK/hsm.id" --cert "$WORK/agent-v2" --signed "$WORK/lunch" \
+  --request "$WORK/lunch.req"
+
+step "14. Bob leaves and Dave joins; the current admins (Alice and Bob) approve the handover"
+$Q admin new --out "$WORK/dave" >/dev/null
+$Q admin propose-admins --admin "$WORK/alice.pub" --admin "$WORK/carol.pub" --admin "$WORK/dave.pub" \
+  --threshold 2 --out "$WORK/p5"
+$Q admin approve --proposal "$WORK/p5" --as "$WORK/alice" --yes --out "$WORK/p5.alice" >/dev/null
+$Q admin approve --proposal "$WORK/p5" --as "$WORK/bob" --yes --out "$WORK/p5.bob" >/dev/null
+$Q admin submit --proposal "$WORK/p5" --approval "$WORK/p5.alice" --approval "$WORK/p5.bob"
+echo "   ...Bob's approval no longer counts:"
+$Q admin propose-delete --key 1 --out "$WORK/p6" >/dev/null
+$Q admin approve --proposal "$WORK/p6" --as "$WORK/bob" --yes --out "$WORK/p6.bob" >/dev/null
+$Q admin approve --proposal "$WORK/p6" --as "$WORK/dave" --yes --out "$WORK/p6.dave" >/dev/null
+expect_denied $Q admin submit --proposal "$WORK/p6" --approval "$WORK/p6.bob" --approval "$WORK/p6.dave"
+
+step "15. The audit log: copy it out, get a signed checkpoint, and check it"
+$Q audit pull --log "$WORK/audit.log"
+$Q audit checkpoint --out "$WORK/checkpoint"
+$Q audit verify --hsm-identity "$WORK/hsm.id" --log "$WORK/audit.log" --checkpoint "$WORK/checkpoint"
+echo "   What the log says (refusals included):"
+$Q audit show --log "$WORK/audit.log" | grep -E "REFUSED|rules changed|admins replaced|wrong PIN" | sed 's/^/   /'
+
+step "16. Someone hides the \$80 attempt by erasing its amount: detected"
+SEQ=$($Q audit show --log "$WORK/audit.log" | grep -m1 'REFUSED (\$80' | sed 's/^#\([0-9]*\).*/\1/')
+cp "$WORK/audit.log" "$WORK/edited.log"
+printf '\0\0\0\0\0\0\0\0' | dd of="$WORK/edited.log" bs=1 seek=$(( (SEQ-1)*54 + 14 )) conv=notrunc status=none
+expect_denied $Q audit verify --hsm-identity "$WORK/hsm.id" --log "$WORK/edited.log" --checkpoint "$WORK/checkpoint"
+
+step "17. Someone deletes that entry instead: also detected"
+{ head -c $(( (SEQ-1)*54 )) "$WORK/audit.log"; tail -c +$(( SEQ*54 + 1 )) "$WORK/audit.log"; } > "$WORK/cut.log"
+expect_denied $Q audit verify --hsm-identity "$WORK/hsm.id" --log "$WORK/cut.log" --checkpoint "$WORK/checkpoint"
 
 step "Where the key stands now"
 $Q agent-key show --key 1

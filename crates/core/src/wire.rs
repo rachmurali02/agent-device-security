@@ -54,8 +54,13 @@ pub enum Cmd {
     SignAction = 0x21,
     GetKeyPolicy = 0x22,
     GetKeyCert = 0x23,
+    UpdatePolicy = 0x24,
     GetAdminChallenge = 0x30,
     DeleteAgentKey = 0x31,
+    ChangeAdmins = 0x32,
+    ReadAudit = 0x40,
+    AuditCheckpoint = 0x41,
+    AckAudit = 0x42,
 }
 
 impl TryFrom<u8> for Cmd {
@@ -75,8 +80,13 @@ impl TryFrom<u8> for Cmd {
             0x21 => Cmd::SignAction,
             0x22 => Cmd::GetKeyPolicy,
             0x23 => Cmd::GetKeyCert,
+            0x24 => Cmd::UpdatePolicy,
             0x30 => Cmd::GetAdminChallenge,
             0x31 => Cmd::DeleteAgentKey,
+            0x32 => Cmd::ChangeAdmins,
+            0x40 => Cmd::ReadAudit,
+            0x41 => Cmd::AuditCheckpoint,
+            0x42 => Cmd::AckAudit,
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -115,6 +125,8 @@ pub enum Status {
     ApprovalInvalid = 0x21,
     /// No pending admin challenge (never requested, or already used).
     NoAdminChallenge = 0x22,
+    /// The audit log is full: copy it out (`ReadAudit` + `AckAudit`) first.
+    AuditFull = 0x30,
 }
 
 impl TryFrom<u8> for Status {
@@ -142,6 +154,7 @@ impl TryFrom<u8> for Status {
             0x20 => Status::QuorumRequired,
             0x21 => Status::ApprovalInvalid,
             0x22 => Status::NoAdminChallenge,
+            0x30 => Status::AuditFull,
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -300,6 +313,27 @@ pub enum Request<'a> {
     GetKeyCert {
         key: u32,
     },
+    /// Replace an agent key's rules. Needs admin sign-off.
+    UpdatePolicy {
+        key: u32,
+        policy: Policy,
+        approvals: Approvals,
+    },
+    /// Replace the admin list. Needs sign-off from the current admins.
+    ChangeAdmins {
+        admins: AdminSet,
+        approvals: Approvals,
+    },
+    /// Audit entries from sequence number `from` that the HSM still holds.
+    ReadAudit {
+        from: u64,
+    },
+    /// A signed checkpoint of the audit chain.
+    AuditCheckpoint,
+    /// The computer has stored entries up to `upto`; the HSM may drop them.
+    AckAudit {
+        upto: u64,
+    },
     /// Get a fresh one-time challenge for a user confirmation.
     GetChallenge,
     /// Ask the HSM to approve and sign an agent action. `confirmation` is the
@@ -346,6 +380,25 @@ impl<'a> Request<'a> {
             },
             Cmd::GetAdminChallenge => Request::GetAdminChallenge,
             Cmd::GetKeyCert => Request::GetKeyCert { key: r.u32()? },
+            Cmd::UpdatePolicy => Request::UpdatePolicy {
+                key: r.u32()?,
+                policy: Policy::read(&mut r)?,
+                approvals: Approvals::read(&mut r)?,
+            },
+            Cmd::ChangeAdmins => {
+                let admins = AdminSet::read(&mut r)?;
+                // The HSM must always have someone who can approve changes.
+                if admins.keys().is_empty() {
+                    return Err(WireError::Invalid);
+                }
+                Request::ChangeAdmins {
+                    admins,
+                    approvals: Approvals::read(&mut r)?,
+                }
+            }
+            Cmd::ReadAudit => Request::ReadAudit { from: r.u64()? },
+            Cmd::AuditCheckpoint => Request::AuditCheckpoint,
+            Cmd::AckAudit => Request::AckAudit { upto: r.u64()? },
             Cmd::GetChallenge => Request::GetChallenge,
             Cmd::SignAction => Request::SignAction {
                 key: r.u32()?,
@@ -408,6 +461,30 @@ impl<'a> Request<'a> {
             Request::GetKeyCert { key } => {
                 w.u8(Cmd::GetKeyCert as u8)?;
                 w.u32(key)?;
+            }
+            Request::UpdatePolicy {
+                key,
+                policy,
+                approvals,
+            } => {
+                w.u8(Cmd::UpdatePolicy as u8)?;
+                w.u32(key)?;
+                policy.write(&mut w)?;
+                approvals.write(&mut w)?;
+            }
+            Request::ChangeAdmins { admins, approvals } => {
+                w.u8(Cmd::ChangeAdmins as u8)?;
+                admins.write(&mut w)?;
+                approvals.write(&mut w)?;
+            }
+            Request::ReadAudit { from } => {
+                w.u8(Cmd::ReadAudit as u8)?;
+                w.u64(from)?;
+            }
+            Request::AuditCheckpoint => w.u8(Cmd::AuditCheckpoint as u8)?,
+            Request::AckAudit { upto } => {
+                w.u8(Cmd::AckAudit as u8)?;
+                w.u64(upto)?;
             }
             Request::GetChallenge => w.u8(Cmd::GetChallenge as u8)?,
             Request::SignAction {
@@ -691,6 +768,45 @@ pub mod resp {
                 cert_sig,
             })
         }
+    }
+
+    /// `ReadAudit` payload: the newest sequence number, the chain head, and
+    /// the held entries from the requested point.
+    pub struct AuditBatch<'a> {
+        pub last_seq: u64,
+        pub head: [u8; 32],
+        entries: &'a [u8],
+    }
+
+    impl<'a> AuditBatch<'a> {
+        pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
+            let mut r = Reader::new(payload);
+            let last_seq = r.u64()?;
+            let head = r.array()?;
+            let n = r.u8()? as usize;
+            let entries = r.raw(n * crate::audit::ENTRY_LEN)?;
+            r.finish()?;
+            Ok(AuditBatch {
+                last_seq,
+                head,
+                entries,
+            })
+        }
+
+        pub fn entries(&self) -> impl Iterator<Item = &'a [u8; crate::audit::ENTRY_LEN]> {
+            self.entries
+                .chunks_exact(crate::audit::ENTRY_LEN)
+                .filter_map(|c| c.try_into().ok())
+        }
+    }
+
+    /// `AuditCheckpoint` payload: checkpoint bytes and identity signature.
+    pub fn decode_checkpoint(payload: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireError> {
+        let mut r = Reader::new(payload);
+        let c = r.bytes(crate::audit::CHECKPOINT_LEN)?;
+        let sig = r.array()?;
+        r.finish()?;
+        Ok((c, sig))
     }
 }
 

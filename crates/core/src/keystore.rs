@@ -42,8 +42,10 @@ pub(crate) struct Slot {
     pub(crate) spent: u64,
     /// Agent keys: number of approved actions. Only ever goes up.
     pub(crate) approved: u64,
-    /// Agent keys: bitmask of the admins who approved creating the key.
+    /// Agent keys: bitmask of the admins who approved the current rules.
     pub(crate) approvers: u8,
+    /// Agent keys: rules version (1 at creation, +1 per approved change).
+    pub(crate) policy_version: u32,
 }
 
 impl Slot {
@@ -61,6 +63,7 @@ impl Slot {
         spent: 0,
         approved: 0,
         approvers: 0,
+        policy_version: 0,
     };
 
     pub fn label(&self) -> &[u8] {
@@ -97,6 +100,7 @@ pub(crate) struct KeyMeta<'a> {
     pub spent: u64,
     pub approved: u64,
     pub approvers: u8,
+    pub policy_version: u32,
 }
 
 impl<'a> KeyMeta<'a> {
@@ -109,6 +113,7 @@ impl<'a> KeyMeta<'a> {
             spent: 0,
             approved: 0,
             approvers: 0,
+            policy_version: 0,
         }
     }
 
@@ -117,6 +122,7 @@ impl<'a> KeyMeta<'a> {
             usage: KeyUsage::Agent,
             policy,
             approvers,
+            policy_version: 1,
             ..Self::general(label, ext_id)
         }
     }
@@ -197,6 +203,7 @@ impl KeyStore {
             spent: meta.spent,
             approved: meta.approved,
             approvers: meta.approvers,
+            policy_version: meta.policy_version,
             ..Slot::EMPTY
         };
         slot.label[..meta.label.len()].copy_from_slice(meta.label);
@@ -255,6 +262,17 @@ impl KeyStore {
         slot.spent = spent;
         slot.approved = approved;
         Some(approved)
+    }
+
+    /// Replaces an agent key's rules after admin approval. Spending and the
+    /// action count are kept, so changing rules never resets a budget.
+    pub(crate) fn update_policy(&mut self, id: u32, policy: Policy, approvers: u8) -> Option<u32> {
+        let slot = self.get_mut(id)?;
+        let version = slot.policy_version.checked_add(1)?;
+        slot.policy = policy;
+        slot.approvers = approvers;
+        slot.policy_version = version;
+        Some(version)
     }
 
     pub fn delete(&mut self, id: u32) -> bool {

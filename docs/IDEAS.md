@@ -52,6 +52,6 @@ Runs first on a host emulator, then on real hardware (see below).
 ## Milestones
 1. ✅ Emulator: key store + Ed25519 signing + PKCS#11 provider passing `pkcs11-tool` tests
 2. ✅ Structured agent-action parsing + per-key policy + spend/sequence counters + user confirmation
-3. ◐ Quorum for agent key create/delete ✅, key birth certificates (policy attestation) ✅, receiver nonces ✅; still to do: quorum policy/admin changes, audit hash chain
+3. ✅ Quorum for agent key create/delete, rule changes and admin changes; key birth certificates with rules versions; receiver nonces; tamper-evident audit hash chain with signed checkpoints
 4. Fuzzing + fault-injection harness, threat model (`docs/THREAT_MODEL.md`)
 5. Port trusted core to the RP2350; provisioning protocol with a secure element

@@ -16,7 +16,7 @@ use crate::wire::{PUBLIC_KEY_LEN, Reader, SERIAL_LEN, SIGNATURE_LEN, WireError, 
 
 pub const KEYCERT_DOMAIN: &[u8; 13] = b"QHSM-KEYCERT\x01";
 pub const KEYCERT_LEN: usize =
-    KEYCERT_DOMAIN.len() + SERIAL_LEN + 4 + PUBLIC_KEY_LEN + POLICY_LEN + 1;
+    KEYCERT_DOMAIN.len() + SERIAL_LEN + 4 + PUBLIC_KEY_LEN + POLICY_LEN + 1 + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyCert {
@@ -24,8 +24,11 @@ pub struct KeyCert {
     pub key: u32,
     pub public: [u8; PUBLIC_KEY_LEN],
     pub policy: Policy,
-    /// Bitmask of the admins (by index) who approved creating the key.
+    /// Bitmask of the admins (by index) who approved the key's current rules.
     pub approvers: u8,
+    /// Version of the rules: 1 when the key is created, +1 on each approved
+    /// change. A newer certificate replaces older ones.
+    pub version: u32,
 }
 
 impl KeyCert {
@@ -37,6 +40,7 @@ impl KeyCert {
         w.raw(&self.public)?;
         self.policy.write(&mut w)?;
         w.u8(self.approvers)?;
+        w.u32(self.version)?;
         Ok(w.len())
     }
 
@@ -51,6 +55,7 @@ impl KeyCert {
             public: r.array()?,
             policy: Policy::read(&mut r)?,
             approvers: r.u8()?,
+            version: r.u32()?,
         };
         r.finish()?;
         Ok(c)

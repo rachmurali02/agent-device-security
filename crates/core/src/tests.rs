@@ -1010,6 +1010,7 @@ mod quorum {
                 public: created.public,
                 policy: policy(),
                 approvers: 0b101, // Alice and Carol
+                version: 1,
             }
         );
     }
@@ -1370,5 +1371,502 @@ mod quorum {
             .0,
             Status::ConfirmationInvalid
         );
+    }
+}
+
+// ---- milestone 3: rule changes, admin changes, audit log ---------------------
+
+mod milestone3 {
+    use super::agent::sign_proposal;
+    use super::*;
+    use crate::admin::{AdminOp, AdminSet, Approvals};
+    use crate::agent::{Action, ActionKind, Policy};
+    use crate::audit::{AUDIT_CAPACITY, ENTRY_LEN, Entry, Event, LogError, verify_log};
+    use crate::cert::{ActionError, verify_action, verify_key_cert};
+    use ed25519_dalek::SigningKey;
+
+    fn policy() -> Policy {
+        Policy {
+            allowed: ActionKind::Payment.bit(),
+            max_amount: 5_000,
+            budget: 10_000,
+            confirm_above: 5_000,
+            always_confirm: 0,
+            confirmer: None,
+            require_nonce: false,
+        }
+    }
+
+    fn pay(cents: u64) -> Action<'static> {
+        Action {
+            kind: ActionKind::Payment,
+            amount: cents,
+            target: b"shop",
+            details: b"",
+            nonce: b"",
+            expires: 0,
+        }
+    }
+
+    fn act(f: &mut Fixture, key: u32, a: Action<'_>) -> (Status, Vec<u8>) {
+        f.call(Request::SignAction {
+            key,
+            action: a,
+            confirmation: None,
+        })
+    }
+
+    /// What an audit collector does: copy out everything held, then release it.
+    fn pull(f: &mut Fixture, from: u64) -> Vec<[u8; ENTRY_LEN]> {
+        let (status, payload) = f.call(Request::ReadAudit { from });
+        assert_eq!(status, Status::Ok);
+        let batch = resp::AuditBatch::decode(&payload).unwrap();
+        let entries: Vec<_> = batch.entries().copied().collect();
+        assert_eq!(
+            f.call(Request::AckAudit {
+                upto: batch.last_seq
+            })
+            .0,
+            Status::Ok
+        );
+        entries
+    }
+
+    fn checkpoint(f: &mut Fixture) -> (Vec<u8>, [u8; 64]) {
+        let (status, payload) = f.call(Request::AuditCheckpoint);
+        assert_eq!(status, Status::Ok);
+        let (cp, sig) = resp::decode_checkpoint(&payload).unwrap();
+        (cp.to_vec(), sig)
+    }
+
+    fn events(entries: &[[u8; ENTRY_LEN]]) -> Vec<(Event, u8)> {
+        entries
+            .iter()
+            .map(|e| {
+                let e = Entry::decode(e).unwrap();
+                (e.event, e.status)
+            })
+            .collect()
+    }
+
+    // -- audit log --
+
+    #[test]
+    fn the_log_starts_at_the_factory_and_records_approvals_and_refusals() {
+        let mut f = Fixture::new();
+        f.call(Request::Login { pin: b"wrong!" });
+        f.login();
+        let k = f.agent_key(policy()).key;
+        act(&mut f, k, pay(100));
+        act(&mut f, k, pay(9_999)); // over the per-payment limit
+        let log = pull(&mut f, 1);
+        assert_eq!(
+            events(&log),
+            vec![
+                (Event::Provisioned, 0),
+                (Event::LoginFailed, Status::PinIncorrect as u8),
+                (Event::LoginOk, 0),
+                (Event::AgentKeyCreated, 0),
+                (Event::ActionApproved, 0),
+                (Event::ActionRefused, Status::AmountTooHigh as u8),
+            ]
+        );
+        let refused = Entry::decode(&log[5]).unwrap();
+        assert_eq!((refused.key, refused.amount), (k, 9_999));
+    }
+
+    #[test]
+    fn people_without_the_pin_cannot_flood_the_log() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy()).key;
+        f.call(Request::Logout);
+        let before = pull(&mut f, 1).len();
+        for _ in 0..100 {
+            assert_eq!(act(&mut f, k, pay(1)).0, Status::NotLoggedIn);
+        }
+        let (_, payload) = f.call(Request::ReadAudit { from: 1 });
+        assert_eq!(
+            resp::AuditBatch::decode(&payload)
+                .unwrap()
+                .entries()
+                .count(),
+            0
+        );
+        assert!(before > 0);
+    }
+
+    #[test]
+    fn a_full_log_stops_the_hsm_until_it_is_copied_out() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy()).key;
+        // Fill the log with refused actions.
+        let mut n = 0;
+        loop {
+            let (status, _) = act(&mut f, k, pay(9_999));
+            if status == Status::AuditFull {
+                break;
+            }
+            assert_eq!(status, Status::AmountTooHigh);
+            n += 1;
+            assert!(n <= AUDIT_CAPACITY);
+        }
+        // Even allowed actions are refused now: they couldn't be recorded.
+        assert_eq!(act(&mut f, k, pay(1)).0, Status::AuditFull);
+        f.call(Request::Logout);
+        assert_eq!(f.call(Request::Login { pin: PIN }).0, Status::AuditFull);
+
+        // An audit collector copies it out (no PIN needed); work resumes.
+        let copied = pull(&mut f, 1);
+        assert_eq!(copied.len(), AUDIT_CAPACITY);
+        f.login();
+        assert_eq!(act(&mut f, k, pay(1)).0, Status::Ok);
+    }
+
+    #[test]
+    fn a_complete_copy_matches_the_signed_checkpoint() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy()).key;
+        let mut log = pull(&mut f, 1);
+        for _ in 0..5 {
+            act(&mut f, k, pay(100));
+        }
+        log.extend(pull(&mut f, log.len() as u64 + 1));
+        let (cp, sig) = checkpoint(&mut f);
+        let id = f.hsm.identity_public();
+        let ok = verify_log(&id, &cp, &sig, &log).unwrap();
+        assert_eq!(ok.seq, log.len() as u64);
+    }
+
+    #[test]
+    fn editing_removing_or_reordering_entries_is_detected() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy()).key;
+        act(&mut f, k, pay(100));
+        act(&mut f, k, pay(9_999));
+        act(&mut f, k, pay(200));
+        let log = pull(&mut f, 1);
+        let (cp, sig) = checkpoint(&mut f);
+        let id = f.hsm.identity_public();
+        assert!(verify_log(&id, &cp, &sig, &log).is_ok());
+
+        // Hide that the refused $99.99 attempt was ever made: change it to $1.
+        let mut edited = log.clone();
+        let i = log.len() - 2;
+        let mut e = Entry::decode(&edited[i]).unwrap();
+        e.amount = 100;
+        edited[i] = e.encode();
+        assert_eq!(
+            verify_log(&id, &cp, &sig, &edited),
+            Err(LogError::HeadMismatch)
+        );
+
+        // Delete it outright.
+        let mut removed = log.clone();
+        removed.remove(i);
+        assert_eq!(
+            verify_log(&id, &cp, &sig, &removed),
+            Err(LogError::BrokenAt(i as u64 + 1))
+        );
+
+        // Swap two entries.
+        let mut swapped = log.clone();
+        swapped.swap(1, 2);
+        assert!(matches!(
+            verify_log(&id, &cp, &sig, &swapped),
+            Err(LogError::BrokenAt(_))
+        ));
+
+        // Drop the most recent entries.
+        assert!(matches!(
+            verify_log(&id, &cp, &sig, &log[..log.len() - 2]),
+            Err(LogError::TooShort { .. })
+        ));
+
+        // A checkpoint "signed" by anyone else.
+        let other = SigningKey::from_bytes(&[5; 32]).verifying_key().to_bytes();
+        assert_eq!(
+            verify_log(&other, &cp, &sig, &log),
+            Err(LogError::BadCheckpoint)
+        );
+    }
+
+    #[test]
+    fn the_log_survives_a_restart() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy()).key;
+        act(&mut f, k, pay(100));
+        let first = pull(&mut f, 1);
+        act(&mut f, k, pay(200));
+        f.hsm = Hsm::load(&f.storage.state).unwrap();
+        f.session = Session::default();
+        f.login();
+        let mut log = first.clone();
+        log.extend(pull(&mut f, first.len() as u64 + 1));
+        let (cp, sig) = checkpoint(&mut f);
+        verify_log(&f.hsm.identity_public(), &cp, &sig, &log).unwrap();
+    }
+
+    #[test]
+    fn releasing_entries_that_dont_exist_is_refused() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.call(Request::AckAudit { upto: 1_000 }).0,
+            Status::BadRequest
+        );
+    }
+
+    // -- changing an agent key's rules --
+
+    fn update(
+        f: &mut Fixture,
+        key: u32,
+        policy: Policy,
+        approvals: Approvals,
+    ) -> (Status, Vec<u8>) {
+        f.call(Request::UpdatePolicy {
+            key,
+            policy,
+            approvals,
+        })
+    }
+
+    #[test]
+    fn the_pin_alone_cannot_loosen_a_keys_rules() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy()).key;
+        let looser = Policy {
+            budget: u64::MAX / 2,
+            ..policy()
+        };
+        f.admin_challenge();
+        assert_eq!(
+            update(&mut f, k, looser, Approvals::default()).0,
+            Status::QuorumRequired
+        );
+        let log = pull(&mut f, 1);
+        assert_eq!(
+            events(&log).last(),
+            Some(&(Event::AdminRequestRefused, Status::QuorumRequired as u8))
+        );
+    }
+
+    #[test]
+    fn admins_can_change_rules_and_spending_carries_over() {
+        let mut f = Fixture::new();
+        f.login();
+        let (k, _, old_cert, old_sig) = f.agent_key_with_cert(policy());
+        assert_eq!(act(&mut f, k, pay(4_000)).0, Status::Ok);
+
+        // Admins halve the budget to $50; $40 is already spent.
+        let tighter = Policy {
+            budget: 5_000,
+            ..policy()
+        };
+        let op = AdminOp::UpdatePolicy {
+            key: k,
+            policy: tighter,
+        };
+        let challenge = f.admin_challenge();
+        let approvals = sign_proposal(&challenge, &op, &[1, 2]);
+        let (status, payload) = update(&mut f, k, tighter, approvals);
+        assert_eq!(status, Status::Ok);
+        let (cert, sig) = resp::decode_cert(&payload).unwrap();
+        let id = f.hsm.identity_public();
+        let c = verify_key_cert(&id, cert, &sig).unwrap();
+        assert_eq!((c.version, c.policy, c.approvers), (2, tighter, 0b110));
+
+        // The new budget applies to what's already spent.
+        assert_eq!(act(&mut f, k, pay(2_000)).0, Status::BudgetExceeded);
+        let (status, payload) = act(&mut f, k, pay(1_000));
+        assert_eq!(status, Status::Ok);
+        let (stmt, ssig) = resp::decode_signed_action(&payload).unwrap();
+
+        // A shop with the new certificate accepts it; one holding the old
+        // certificate sees the rules changed and must fetch the new one.
+        assert!(verify_action(&id, cert, &sig, stmt, &ssig).is_ok());
+        assert_eq!(
+            verify_action(&id, &old_cert, &old_sig, stmt, &ssig),
+            Err(ActionError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn approvals_for_one_rule_change_cannot_be_used_for_another() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy()).key;
+        let modest = Policy {
+            budget: 20_000,
+            ..policy()
+        };
+        let greedy = Policy {
+            budget: 2_000_000,
+            ..policy()
+        };
+        let challenge = f.admin_challenge();
+        let approvals = sign_proposal(
+            &challenge,
+            &AdminOp::UpdatePolicy {
+                key: k,
+                policy: modest,
+            },
+            &[0, 1],
+        );
+        assert_eq!(
+            update(&mut f, k, greedy, approvals).0,
+            Status::ApprovalInvalid
+        );
+    }
+
+    #[test]
+    fn a_budget_lowered_below_spending_survives_a_restart() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy()).key;
+        act(&mut f, k, pay(5_000));
+        let frozen = Policy {
+            budget: 100,
+            ..policy()
+        };
+        let challenge = f.admin_challenge();
+        let approvals = sign_proposal(
+            &challenge,
+            &AdminOp::UpdatePolicy {
+                key: k,
+                policy: frozen,
+            },
+            &[0, 1],
+        );
+        assert_eq!(update(&mut f, k, frozen, approvals).0, Status::Ok);
+        f.hsm = Hsm::load(&f.storage.state).unwrap();
+        f.session = Session::default();
+        f.login();
+        assert_eq!(act(&mut f, k, pay(1)).0, Status::BudgetExceeded);
+    }
+
+    // -- changing the admins --
+
+    fn new_admins() -> [SigningKey; 2] {
+        [31, 32].map(|b| SigningKey::from_bytes(&[b; 32]))
+    }
+
+    fn new_admin_set() -> AdminSet {
+        AdminSet::new(&new_admins().map(|k| k.verifying_key().to_bytes()), 2).unwrap()
+    }
+
+    #[test]
+    fn current_admins_hand_over_to_new_ones() {
+        let mut f = Fixture::new();
+        f.login();
+        let admins = new_admin_set();
+        let challenge = f.admin_challenge();
+        let approvals = sign_proposal(&challenge, &AdminOp::ChangeAdmins { admins }, &[0, 2]);
+        assert_eq!(
+            f.call(Request::ChangeAdmins { admins, approvals }).0,
+            Status::Ok
+        );
+        let (_, payload) = f.call(Request::GetIdentity);
+        assert_eq!(resp::Identity::decode(&payload).unwrap().admins, admins);
+
+        // The old admins no longer count...
+        let challenge = f.admin_challenge();
+        let old = sign_proposal(
+            &challenge,
+            &AdminOp::CreateAgentKey {
+                label: b"agent",
+                ext_id: b"",
+                policy: policy(),
+            },
+            &[0, 1],
+        );
+        assert_eq!(
+            f.call(Request::GenerateAgentKey {
+                label: b"agent",
+                ext_id: b"",
+                policy: policy(),
+                approvals: old,
+            })
+            .0,
+            Status::ApprovalInvalid
+        );
+        // ...and the new ones do.
+        let challenge = f.admin_challenge();
+        let mut buf = [0u8; crate::admin::MAX_PROPOSAL];
+        let n = crate::admin::Proposal {
+            serial: *b"TESTSERIAL000001",
+            challenge,
+            op: AdminOp::CreateAgentKey {
+                label: b"agent",
+                ext_id: b"",
+                policy: policy(),
+            },
+        }
+        .encode(&mut buf)
+        .unwrap();
+        let mut approvals = Approvals::default();
+        for (i, k) in new_admins().iter().enumerate() {
+            use ed25519_dalek::Signer;
+            approvals
+                .push(i as u8, k.sign(&buf[..n]).to_bytes())
+                .unwrap();
+        }
+        assert_eq!(
+            f.call(Request::GenerateAgentKey {
+                label: b"agent",
+                ext_id: b"",
+                policy: policy(),
+                approvals,
+            })
+            .0,
+            Status::Ok
+        );
+        assert!(events(&pull(&mut f, 1)).contains(&(Event::AdminsChanged, 0)));
+    }
+
+    #[test]
+    fn would_be_admins_cannot_install_themselves() {
+        let mut f = Fixture::new();
+        f.login();
+        let admins = new_admin_set();
+        let challenge = f.admin_challenge();
+        let mut buf = [0u8; crate::admin::MAX_PROPOSAL];
+        let n = crate::admin::Proposal {
+            serial: *b"TESTSERIAL000001",
+            challenge,
+            op: AdminOp::ChangeAdmins { admins },
+        }
+        .encode(&mut buf)
+        .unwrap();
+        let mut approvals = Approvals::default();
+        for (i, k) in new_admins().iter().enumerate() {
+            use ed25519_dalek::Signer;
+            approvals
+                .push(i as u8, k.sign(&buf[..n]).to_bytes())
+                .unwrap();
+        }
+        assert_eq!(
+            f.call(Request::ChangeAdmins { admins, approvals }).0,
+            Status::ApprovalInvalid
+        );
+    }
+
+    #[test]
+    fn the_admin_list_can_never_be_emptied() {
+        let mut f = Fixture::new();
+        f.login();
+        let mut buf = [0u8; MAX_FRAME];
+        let n = Request::ChangeAdmins {
+            admins: AdminSet::NONE,
+            approvals: Approvals::default(),
+        }
+        .encode(&mut buf)
+        .unwrap();
+        assert_eq!(f.raw(&buf[..n]), vec![Status::BadRequest as u8]);
     }
 }

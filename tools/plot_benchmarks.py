@@ -31,6 +31,18 @@ THREADS = {
     QUORUM: "quorum-hsm emulator: raw signing via PKCS#11",
     SOFT: "SoftHSM2: raw signing via PKCS#11",
 }
+REFUSE = (ACTION[0], {
+    QUORUM: "quorum-hsm emulator, refusing an action (refusal recorded in the audit log, saved with fsync)",
+    SOFT: "SoftHSM2 + rules on the host, refusing an action (nothing recorded)",
+})
+ADMIN_WORK = [
+    ("Create + delete agent key", KEYGEN[0],
+     "quorum-hsm: agent key with 2-of-3 admin sign-off + birth certificate (create + delete pair)"),
+    ("Change a key's rules", KEYGEN[0],
+     "quorum-hsm: change an agent key's rules with 2-of-3 sign-off + new certificate"),
+    ("Check 1,000 log entries", ACTION[0],
+     "Auditor check: 1,000-entry audit log against a signed checkpoint (no HSM)"),
+]
 BREAKDOWN = [
     ("Rule check + signing only", "quorum-hsm core, in process (no socket, no disk)"),
     ("+ socket and file write", "quorum-hsm emulator, fsync off (unsafe; shows cost of durability)"),
@@ -66,11 +78,11 @@ def nice_max(v):
 
 def fmt(v, unit):
     if unit == "µs":
-        return f"{v:,.0f} µs"
+        return "<1 µs" if v < 1 else f"{v:,.0f} µs"
     if unit == "ms":
         return f"{v:.1f} ms"
-    if unit == "of 6":
-        return f"{v:.0f} of 6"
+    if unit.startswith("of "):
+        return f"{v:.0f} {unit}"
     return f"{v:,.0f}"
 
 
@@ -103,8 +115,9 @@ class Svg:
         plot_x = px + self.LEFT_LABEL
         plot_w = self.PANEL_W - self.LEFT_LABEL - 70  # room for value labels
         top = py + 50
-        if unit == "of 6":
-            vmax, steps = 6, 3
+        if unit.startswith("of "):
+            vmax = int(unit[3:])
+            steps = vmax // 2 if vmax % 2 == 0 and vmax <= 10 else vmax
         else:
             vmax = nice_max(max(hi for _, _, (m, lo, hi), _ in rows))
             lead = vmax / 10 ** (len(str(int(vmax))) - 1)
@@ -229,10 +242,14 @@ def main(paths):
         per_run = [sum(int(data[("attack", n)][run][idx] or 0) for n in names) for run in range(runs)]
         return statistics.median(per_run), min(per_run), max(per_run)
 
+    soft_blocks = [n for n in names
+                   if all(r[1] == "1" for r in data[("attack", n)])]
+    note = ("The one SoftHSM2 blocks: " + soft_blocks[0][:1].lower() + soft_blocks[0][1:] + "."
+            if len(soft_blocks) == 1 else None)
     panels.append(("Attacks blocked",
-                   "Six attacks by someone who controls the computer and knows the PIN",
-                   [(QUORUM, "s1", blocked(0), None), (SOFT, "s2", blocked(1), None)], "of 6",
-                   "The one SoftHSM2 blocks: reading the private key out."))
+                   f"{len(names)} attacks by someone who controls the computer and knows the PIN",
+                   [(QUORUM, "s1", blocked(0), None), (SOFT, "s2", blocked(1), None)],
+                   f"of {len(names)}", note))
 
     thread_rows = []
     for label, col in (("1 thread", 0), ("4 threads", 1)):
@@ -245,6 +262,15 @@ def main(paths):
                    "Median time in µs; the rule check itself is a small part",
                    [(label, "s1", series(data, sec, opt, 0), None) for label, opt in BREAKDOWN], "µs",
                    "Most of the cost is making sure a power cut can't lose a counted payment."))
+
+    panels.append(("Refuse an action", "Median time in µs, lower is better",
+                   pair(REFUSE, 0), "µs",
+                   "Ours saves every refusal in a tamper-evident log; SoftHSM2 records nothing."))
+    panels.append(("Admin and audit work (quorum-hsm)",
+                   "Median time in ms; rare operations, each needing 2 of 3 admins",
+                   [(label, "s1", series(data, sec, opt, 0, 1 / 1000), None)
+                    for label, sec, opt in ADMIN_WORK], "ms",
+                   "The audit check runs anywhere: no HSM needed."))
 
     # Two panels per row; each row starts below the taller panel above it.
     y = 100

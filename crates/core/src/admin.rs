@@ -25,15 +25,19 @@ pub const MAX_ADMINS: usize = 8;
 pub const ADMIN_DOMAIN: &[u8; 11] = b"QHSM-ADMIN\x01";
 
 /// Largest possible proposal.
-pub const MAX_PROPOSAL: usize = ADMIN_DOMAIN.len()
-    + SERIAL_LEN
-    + CHALLENGE_LEN
-    + 1
-    + 2
-    + MAX_LABEL
-    + 2
-    + MAX_EXT_ID
-    + POLICY_LEN;
+pub const MAX_PROPOSAL: usize = ADMIN_DOMAIN.len() + SERIAL_LEN + CHALLENGE_LEN + MAX_OP;
+
+const fn max(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+/// Largest encoded operation.
+const MAX_OP: usize = max(
+    max(
+        1 + 2 + MAX_LABEL + 2 + MAX_EXT_ID + POLICY_LEN,
+        1 + 4 + POLICY_LEN,
+    ),
+    1 + 2 + MAX_ADMINS * PUBLIC_KEY_LEN,
+);
 
 /// The operations that need sign-off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +50,15 @@ pub enum AdminOp<'a> {
     DeleteAgentKey {
         key: u32,
     },
+    /// Replace an agent key's rules. Spending so far is kept.
+    UpdatePolicy {
+        key: u32,
+        policy: Policy,
+    },
+    /// Replace the admin list and threshold. Approved by the *current* admins.
+    ChangeAdmins {
+        admins: AdminSet,
+    },
 }
 
 impl<'a> AdminOp<'a> {
@@ -57,6 +70,18 @@ impl<'a> AdminOp<'a> {
                 policy: Policy::read(r)?,
             },
             2 => AdminOp::DeleteAgentKey { key: r.u32()? },
+            3 => AdminOp::UpdatePolicy {
+                key: r.u32()?,
+                policy: Policy::read(r)?,
+            },
+            4 => {
+                let admins = AdminSet::read(r)?;
+                // The HSM must always have someone who can approve changes.
+                if admins.keys().is_empty() {
+                    return Err(WireError::Invalid);
+                }
+                AdminOp::ChangeAdmins { admins }
+            }
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -76,6 +101,18 @@ impl<'a> AdminOp<'a> {
             AdminOp::DeleteAgentKey { key } => {
                 w.u8(2)?;
                 w.u32(key)
+            }
+            AdminOp::UpdatePolicy { key, policy } => {
+                w.u8(3)?;
+                w.u32(key)?;
+                policy.write(w)
+            }
+            AdminOp::ChangeAdmins { admins } => {
+                if admins.keys().is_empty() {
+                    return Err(WireError::Invalid);
+                }
+                w.u8(4)?;
+                admins.write(w)
             }
         }
     }

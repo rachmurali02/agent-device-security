@@ -82,6 +82,8 @@ fn status_to_rv(s: Status) -> CK_RV {
         Status::QuorumRequired | Status::ApprovalInvalid | Status::NoAdminChallenge => {
             CKR_ACTION_PROHIBITED
         }
+        // The HSM won't act until its audit log is copied out (`quorum audit pull`).
+        Status::AuditFull => CKR_DEVICE_MEMORY,
     }
 }
 

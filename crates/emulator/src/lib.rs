@@ -148,6 +148,11 @@ fn log(req: &[u8], out: &[u8]) {
         Ok(Request::GetAdminChallenge) => "AdminChallenge",
         Ok(Request::DeleteAgentKey { .. }) => "DelAgentKey",
         Ok(Request::GetKeyCert { .. }) => "GetKeyCert",
+        Ok(Request::UpdatePolicy { .. }) => "UpdatePolicy",
+        Ok(Request::ChangeAdmins { .. }) => "ChangeAdmins",
+        Ok(Request::ReadAudit { .. }) => "ReadAudit",
+        Ok(Request::AuditCheckpoint) => "Checkpoint",
+        Ok(Request::AckAudit { .. }) => "AckAudit",
         Err(_) => "<malformed>",
     };
     match resp::split(out) {

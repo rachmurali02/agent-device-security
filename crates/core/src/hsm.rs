@@ -15,6 +15,7 @@ use crate::admin::{AdminOp, AdminSet, Approvals, MAX_ADMINS, MAX_PROPOSAL, Propo
 use crate::agent::{
     Action, CHALLENGE_LEN, MAX_STATEMENT, POLICY_LEN, Policy, Statement, confirmation_valid,
 };
+use crate::audit::{AUDIT_STATE_MAX, AuditLog, Checkpoint, Event, digest};
 use crate::cert::{KEYCERT_LEN, KeyCert};
 use crate::keystore::{KeyMeta, KeyStore, MAX_KEYS, SECRET_LEN, UseError};
 use crate::wire::{
@@ -22,14 +23,14 @@ use crate::wire::{
     Status, WireError, Writer, resp,
 };
 
-pub const FW_VERSION: (u8, u8) = (0, 3);
+pub const FW_VERSION: (u8, u8) = (0, 4);
 pub const MAX_PIN_TRIES: u8 = 5;
 
 const STATE_MAGIC: &[u8; 4] = b"QHSM";
-const STATE_VERSION: u8 = 3;
+const STATE_VERSION: u8 = 4;
 /// Worst case per key: an agent key, which also stores its policy and counters.
 const SLOT_STATE_LEN: usize =
-    4 + 1 + MAX_LABEL + 1 + MAX_EXT_ID + SECRET_LEN + 1 + POLICY_LEN + 8 + 8 + 1;
+    4 + 1 + MAX_LABEL + 1 + MAX_EXT_ID + SECRET_LEN + 1 + POLICY_LEN + 8 + 8 + 1 + 4;
 const IDENTITY_SECRET_LEN: usize = 32;
 const ADMINS_STATE_LEN: usize = 2 + MAX_ADMINS * 32;
 /// Upper bound on the serialized state size.
@@ -41,6 +42,7 @@ pub const STATE_MAX: usize = 4
     + 1
     + IDENTITY_SECRET_LEN
     + ADMINS_STATE_LEN
+    + AUDIT_STATE_MAX
     + 4
     + 1
     + MAX_KEYS * SLOT_STATE_LEN;
@@ -106,9 +108,12 @@ pub struct Hsm {
     pin_len: u8,
     pin_tries_left: u8,
     store: KeyStore,
-    /// Signs birth certificates and nothing else. Created at the factory,
-    /// never leaves the HSM.
+    /// Signs birth certificates and audit checkpoints, each with its own
+    /// domain prefix, and never anything the computer chooses. Created at
+    /// the factory, never leaves the HSM.
     identity: [u8; IDENTITY_SECRET_LEN],
+    #[zeroize(skip)]
+    audit: AuditLog,
     #[zeroize(skip)]
     admins: AdminSet,
     /// One-time challenge for the pending admin proposal. Kept in RAM only:
@@ -139,12 +144,17 @@ impl Hsm {
             pin_tries_left: MAX_PIN_TRIES,
             store: KeyStore::new(),
             identity: [0; IDENTITY_SECRET_LEN],
+            audit: AuditLog::new(),
             admins,
             admin_challenge: None,
             faulted: false,
         };
         rng.fill_bytes(&mut hsm.identity);
         hsm.pin[..p.pin.len()].copy_from_slice(p.pin);
+        // Entry #1 records who the admins were at the factory.
+        let admins_digest = hsm.admins_digest();
+        hsm.record(Event::Provisioned, Status::Ok, 0, 0, admins_digest)
+            .map_err(|_| InitError::Storage)?;
         hsm.commit(storage).map_err(|_| InitError::Storage)?;
         Ok(hsm)
     }
@@ -232,10 +242,12 @@ impl Hsm {
 
             Request::GenerateKey { label, ext_id } => {
                 require_login(session)?;
+                self.audit_room()?;
                 let (id, public) = self
                     .store
                     .generate(rng, KeyMeta::general(label, ext_id))
                     .map_err(|_| Status::StoreFull)?;
+                self.record(Event::KeyCreated, Status::Ok, id, 0, digest(&[&public]))?;
                 // The key does not exist until it is durable. If the commit
                 // fails we fault rather than hand out a key that a restart
                 // would silently lose.
@@ -276,7 +288,10 @@ impl Hsm {
                 if slot.usage == KeyUsage::Agent {
                     return Err(Status::QuorumRequired);
                 }
+                self.audit_room()?;
+                let public = slot.public;
                 self.store.delete(key);
+                self.record(Event::KeyDeleted, Status::Ok, key, 0, digest(&[&public]))?;
                 self.commit(storage)
             }
 
@@ -308,11 +323,12 @@ impl Hsm {
                     ext_id,
                     policy,
                 };
-                let approvers = self.check_quorum(&op, &approvals)?;
+                let approvers = self.admin_op(storage, 0, &op, &approvals)?;
                 let (id, public) = self
                     .store
                     .generate(rng, KeyMeta::agent(label, ext_id, policy, approvers))
                     .map_err(|_| Status::StoreFull)?;
+                self.record(Event::AgentKeyCreated, Status::Ok, id, 0, policy.digest())?;
                 self.commit(storage)?;
                 w.u32(id).map_err(overflow)?;
                 w.raw(&public).map_err(overflow)?;
@@ -325,8 +341,81 @@ impl Hsm {
                 if slot.usage != KeyUsage::Agent {
                     return Err(Status::UsageNotAllowed);
                 }
-                self.check_quorum(&AdminOp::DeleteAgentKey { key }, &approvals)?;
+                let op = AdminOp::DeleteAgentKey { key };
+                self.admin_op(storage, key, &op, &approvals)?;
+                let public = self.store.get(key).map(|s| s.public).unwrap_or_default();
                 self.store.delete(key);
+                self.record(
+                    Event::AgentKeyDeleted,
+                    Status::Ok,
+                    key,
+                    0,
+                    digest(&[&public]),
+                )?;
+                self.commit(storage)
+            }
+
+            Request::UpdatePolicy {
+                key,
+                policy,
+                approvals,
+            } => {
+                require_login(session)?;
+                let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
+                if slot.usage != KeyUsage::Agent {
+                    return Err(Status::UsageNotAllowed);
+                }
+                let op = AdminOp::UpdatePolicy { key, policy };
+                let approvers = self.admin_op(storage, key, &op, &approvals)?;
+                self.store
+                    .update_policy(key, policy, approvers)
+                    .ok_or(Status::KeyNotFound)?;
+                self.record(Event::PolicyUpdated, Status::Ok, key, 0, policy.digest())?;
+                self.commit(storage)?;
+                self.write_cert(key, w)
+            }
+
+            Request::ChangeAdmins { admins, approvals } => {
+                require_login(session)?;
+                // Approved by the admins in charge *now*, not the new ones.
+                self.admin_op(storage, 0, &AdminOp::ChangeAdmins { admins }, &approvals)?;
+                self.admins = admins;
+                let admins_digest = self.admins_digest();
+                self.record(Event::AdminsChanged, Status::Ok, 0, 0, admins_digest)?;
+                self.commit(storage)
+            }
+
+            // The log is evidence, not a secret: anyone may read it, and
+            // anyone may release entries already copied out. Releasing
+            // without keeping a copy only destroys the copier's own evidence,
+            // and shows up as a gap against any checkpoint.
+            Request::ReadAudit { from } => {
+                w.u64(self.audit.last_seq()).map_err(overflow)?;
+                w.raw(&self.audit.head()).map_err(overflow)?;
+                let n = self.audit.entries_from(from).count();
+                w.u8(n as u8).map_err(overflow)?;
+                for e in self.audit.entries_from(from) {
+                    w.raw(e).map_err(overflow)?;
+                }
+                Ok(())
+            }
+
+            Request::AuditCheckpoint => {
+                let cp = Checkpoint {
+                    serial: self.serial,
+                    seq: self.audit.last_seq(),
+                    head: self.audit.head(),
+                }
+                .encode();
+                let sig = SigningKey::from_bytes(&self.identity).sign(&cp).to_bytes();
+                w.bytes(&cp).map_err(overflow)?;
+                w.raw(&sig).map_err(overflow)
+            }
+
+            Request::AckAudit { upto } => {
+                if !self.audit.ack(upto) {
+                    return Err(Status::BadRequest);
+                }
                 self.commit(storage)
             }
 
@@ -383,6 +472,33 @@ impl Hsm {
         w: &mut Writer<'_>,
     ) -> Result<(), Status> {
         require_login(session)?;
+        // No room to record the outcome: refuse before anything else, so not
+        // even a refusal goes unrecorded.
+        self.audit_room()?;
+        match self.check_action(session, key, action, confirmation) {
+            Ok(confirmed) => self.approve_action(storage, key, action, confirmed, w),
+            Err(status) => {
+                let mut buf = [0u8; MAX_STATEMENT];
+                let mut aw = Writer::new(&mut buf);
+                let _ = action.write(&mut aw);
+                let n = aw.len();
+                let what = digest(&[&buf[..n]]);
+                self.record(Event::ActionRefused, status, key, action.amount, what)?;
+                self.commit(storage)?;
+                Err(status)
+            }
+        }
+    }
+
+    /// Every rule check, in a fixed order; the first failure wins. Returns
+    /// whether the user confirmed.
+    fn check_action(
+        &self,
+        session: &mut Session,
+        key: u32,
+        action: &Action<'_>,
+        confirmation: Option<[u8; SIGNATURE_LEN]>,
+    ) -> Result<bool, Status> {
         let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
         if slot.usage != KeyUsage::Agent {
             return Err(Status::UsageNotAllowed);
@@ -423,7 +539,18 @@ impl Hsm {
             }
             None => false,
         };
+        Ok(confirmed)
+    }
 
+    fn approve_action(
+        &mut self,
+        storage: &mut impl Storage,
+        key: u32,
+        action: &Action<'_>,
+        confirmed: bool,
+        w: &mut Writer<'_>,
+    ) -> Result<(), Status> {
+        let policy = self.store.get(key).ok_or(Status::KeyNotFound)?.policy;
         // All checks passed. Charge the action and make that durable *before*
         // signing: a crash or power cut can never yield a signature that
         // was not counted against the budget, or reuse a sequence number.
@@ -431,8 +558,6 @@ impl Hsm {
             .store
             .charge(key, action.amount)
             .ok_or(Status::BudgetExceeded)?;
-        self.commit(storage)?;
-
         let statement = Statement {
             serial: self.serial,
             key,
@@ -445,6 +570,11 @@ impl Hsm {
         let mut sw = Writer::new(&mut buf);
         statement.write(&mut sw).map_err(|_| Status::Fault)?;
         let len = sw.len();
+        // The approval is logged in the same save as the spending.
+        let what = digest(&[&buf[..len]]);
+        self.record(Event::ActionApproved, Status::Ok, key, action.amount, what)?;
+        self.commit(storage)?;
+
         let sig = self
             .store
             .sign_statement(key, &buf[..len])
@@ -453,6 +583,66 @@ impl Hsm {
         let overflow = |_: WireError| Status::ResponseTooLarge;
         w.bytes(&buf[..len]).map_err(overflow)?;
         w.raw(&sig).map_err(overflow)
+    }
+
+    /// Fails with `AuditFull` if the log cannot take another entry.
+    fn audit_room(&self) -> Result<(), Status> {
+        if self.audit.is_full() {
+            Err(Status::AuditFull)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record(
+        &mut self,
+        event: Event,
+        status: Status,
+        key: u32,
+        amount: u64,
+        what: [u8; 32],
+    ) -> Result<(), Status> {
+        self.audit
+            .append(event, status as u8, key, amount, what)
+            .map(drop)
+            .map_err(|_| Status::AuditFull)
+    }
+
+    fn admins_digest(&self) -> [u8; 32] {
+        let mut buf = [0u8; ADMINS_STATE_LEN];
+        let mut w = Writer::new(&mut buf);
+        let _ = self.admins.write(&mut w);
+        let n = w.len();
+        digest(&[&buf[..n]])
+    }
+
+    /// Checks admin sign-off for `op`, recording a refusal in the audit log.
+    fn admin_op(
+        &mut self,
+        storage: &mut impl Storage,
+        key: u32,
+        op: &AdminOp<'_>,
+        approvals: &Approvals,
+    ) -> Result<u8, Status> {
+        self.audit_room()?;
+        match self.check_quorum(op, approvals) {
+            Ok(approvers) => Ok(approvers),
+            Err(status) => {
+                let mut buf = [0u8; MAX_PROPOSAL];
+                let mut w = Writer::new(&mut buf);
+                let _ = op.write(&mut w);
+                let n = w.len();
+                self.record(
+                    Event::AdminRequestRefused,
+                    status,
+                    key,
+                    0,
+                    digest(&[&buf[..n]]),
+                )?;
+                self.commit(storage)?;
+                Err(status)
+            }
+        }
     }
 
     /// Uses up the pending admin challenge and checks the approvals against
@@ -493,6 +683,7 @@ impl Hsm {
             public: slot.public,
             policy: slot.policy,
             approvers: slot.approvers,
+            version: slot.policy_version,
         };
         let mut buf = [0u8; KEYCERT_LEN];
         let len = cert.encode(&mut buf).map_err(|_| Status::Fault)?;
@@ -514,6 +705,8 @@ impl Hsm {
         if self.pin_tries_left == 0 {
             return Err(Status::PinLocked);
         }
+        // The outcome must be recordable; otherwise don't even try.
+        self.audit_room()?;
 
         // Spend the attempt and make that durable *before* comparing. If an
         // attacker cuts power the moment they detect a wrong guess (timing,
@@ -524,13 +717,19 @@ impl Hsm {
 
         if self.pin_matches(pin) {
             self.pin_tries_left = MAX_PIN_TRIES;
+            self.record(Event::LoginOk, Status::Ok, 0, 0, [0; 32])?;
             self.commit(storage)?;
             session.logged_in = true;
             Ok(())
-        } else if self.pin_tries_left == 0 {
-            Err(Status::PinLocked)
         } else {
-            Err(Status::PinIncorrect)
+            let status = if self.pin_tries_left == 0 {
+                Status::PinLocked
+            } else {
+                Status::PinIncorrect
+            };
+            self.record(Event::LoginFailed, status, 0, 0, [0; 32])?;
+            self.commit(storage)?;
+            Err(status)
         }
     }
 
@@ -575,6 +774,7 @@ impl Hsm {
         w.u8(self.pin_tries_left)?;
         w.raw(&self.identity)?;
         self.admins.write(&mut w)?;
+        self.audit.write_state(&mut w)?;
         w.u32(self.store.next_id())?;
         w.u8(self.store.len() as u8)?;
         for slot in self.store.slots() {
@@ -590,6 +790,7 @@ impl Hsm {
                 w.u64(slot.spent)?;
                 w.u64(slot.approved)?;
                 w.u8(slot.approvers)?;
+                w.u32(slot.policy_version)?;
             }
         }
         Ok(w.len())
@@ -614,6 +815,7 @@ impl Hsm {
             store: KeyStore::new(),
             identity: r.array().map_err(bad)?,
             admins: AdminSet::read(&mut r).map_err(bad)?,
+            audit: AuditLog::read_state(&mut r).map_err(bad)?,
             admin_challenge: None,
             faulted: false,
         };
@@ -676,12 +878,15 @@ fn read_key_meta<'a>(
             let spent = r.u64().map_err(bad)?;
             let approved = r.u64().map_err(bad)?;
             let approvers = r.u8().map_err(bad)?;
-            if spent > policy.budget {
+            let policy_version = r.u32().map_err(bad)?;
+            // Note: `spent` may exceed the budget after admins lower it.
+            if policy_version == 0 {
                 return Err(StateError::Malformed);
             }
             Ok(KeyMeta {
                 spent,
                 approved,
+                policy_version,
                 ..KeyMeta::agent(label, ext_id, policy, approvers)
             })
         }

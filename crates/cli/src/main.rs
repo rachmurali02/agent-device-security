@@ -22,10 +22,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use quorum_client::Client;
-use quorum_core::admin::{AdminOp, Approvals, MAX_PROPOSAL, Proposal};
+use quorum_core::admin::{AdminOp, AdminSet, Approvals, MAX_PROPOSAL, Proposal};
 use quorum_core::agent::{
     Action, ActionKind, CONFIRM_MESSAGE_MAX, Policy, VerifyError, confirmation_message,
 };
+use quorum_core::audit::{Checkpoint, ENTRY_LEN, Entry, Event, LogError, verify_log};
 use quorum_core::cert::{ActionError, CertError, KeyCert, verify_action};
 use quorum_core::wire::{KeyUsage, Request, Status, resp};
 use rand_core::{OsRng, RngCore};
@@ -61,6 +62,9 @@ enum Command {
     Shop(ShopCmd),
     /// Ask the HSM to approve and sign an agent action.
     Act(ActArgs),
+    /// The HSM's tamper-evident audit log.
+    #[command(subcommand)]
+    Audit(AuditCmd),
     /// Check a signed action, as the receiver, with no HSM involved.
     Verify(VerifyArgs),
 }
@@ -91,6 +95,32 @@ enum AdminCmd {
     },
     /// Start a proposal to create an agent key with these rules.
     ProposeCreate(ProposeCreateArgs),
+    /// Start a proposal to change an agent key's rules.
+    ProposeUpdate {
+        #[command(flatten)]
+        login: Login,
+        #[arg(long)]
+        key: u32,
+        #[command(flatten)]
+        rules: RuleArgs,
+        /// Where to write the proposal for admins to review.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Start a proposal to replace the admins (approved by the current ones).
+    ProposeAdmins {
+        #[command(flatten)]
+        login: Login,
+        /// Public key file of each new admin, in order.
+        #[arg(long = "admin", required = true)]
+        admins: Vec<PathBuf>,
+        /// How many of the new admins must agree from now on.
+        #[arg(long)]
+        threshold: u8,
+        /// Where to write the proposal for admins to review.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Start a proposal to delete an agent key.
     ProposeDelete {
         #[command(flatten)]
@@ -123,7 +153,7 @@ enum AdminCmd {
         proposal: PathBuf,
         #[arg(long = "approval", required = true)]
         approvals: Vec<PathBuf>,
-        /// For a new key: where to save its birth certificate.
+        /// For a new key or changed rules: where to save the birth certificate.
         #[arg(long)]
         cert_out: Option<PathBuf>,
     },
@@ -135,6 +165,16 @@ struct ProposeCreateArgs {
     login: Login,
     #[arg(long)]
     label: String,
+    #[command(flatten)]
+    rules: RuleArgs,
+    /// Where to write the proposal for admins to review.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+/// An agent key's rules.
+#[derive(Args)]
+struct RuleArgs {
     /// Allowed action kinds, comma-separated:
     /// send_message, payment, install_software, share_data, delete_data.
     #[arg(long, value_delimiter = ',', required = true)]
@@ -157,9 +197,35 @@ struct ProposeCreateArgs {
     /// Refuse actions that don't carry a receiver's one-time code.
     #[arg(long)]
     require_request: bool,
-    /// Where to write the proposal for admins to review.
-    #[arg(long)]
-    out: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum AuditCmd {
+    /// Copy new entries out of the HSM into a log file, then let the HSM
+    /// release them. No PIN needed.
+    Pull {
+        #[arg(long)]
+        log: PathBuf,
+    },
+    /// Save a checkpoint signed by the HSM (to <out> and <out>.sig).
+    Checkpoint {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Prove a log file is complete and unaltered up to a checkpoint.
+    Verify {
+        #[arg(long)]
+        hsm_identity: PathBuf,
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(long)]
+        checkpoint: PathBuf,
+    },
+    /// Print a log file in plain English.
+    Show {
+        #[arg(long)]
+        log: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -256,6 +322,31 @@ fn run(cmd: Command) -> Result<()> {
         Command::Keys => list_keys(),
         Command::Admin(AdminCmd::New { out }) => new_key_file(&out, "admin"),
         Command::Admin(AdminCmd::ProposeCreate(args)) => propose_create(args),
+        Command::Admin(AdminCmd::ProposeUpdate {
+            login,
+            key,
+            rules,
+            out,
+        }) => {
+            let policy = rules.policy()?;
+            show_current_rules(key)?;
+            propose(&login, AdminOp::UpdatePolicy { key, policy }, &out)
+        }
+        Command::Admin(AdminCmd::ProposeAdmins {
+            login,
+            admins,
+            threshold,
+            out,
+        }) => {
+            let keys = admins
+                .iter()
+                .map(|p| read_hex_file::<32>(p))
+                .collect::<Result<Vec<_>>>()?;
+            let admins = AdminSet::new(&keys, threshold).map_err(|_| {
+                "invalid admin list: keys must be valid and different, and the threshold between 1 and the number of admins".to_string()
+            })?;
+            propose(&login, AdminOp::ChangeAdmins { admins }, &out)
+        }
         Command::Admin(AdminCmd::ProposeDelete { login, key, out }) => {
             propose(&login, AdminOp::DeleteAgentKey { key }, &out)
         }
@@ -276,6 +367,14 @@ fn run(cmd: Command) -> Result<()> {
         Command::Confirmer(KeyFileCmd::New { out }) => new_key_file(&out, "confirmation device"),
         Command::Shop(ShopCmd::Request { valid_for, out }) => shop_request(valid_for, &out),
         Command::Act(args) => act(args),
+        Command::Audit(AuditCmd::Pull { log }) => audit_pull(&log),
+        Command::Audit(AuditCmd::Checkpoint { out }) => audit_checkpoint(&out),
+        Command::Audit(AuditCmd::Verify {
+            hsm_identity,
+            log,
+            checkpoint,
+        }) => audit_verify(&hsm_identity, &log, &checkpoint),
+        Command::Audit(AuditCmd::Show { log }) => audit_show(&log),
         Command::Verify(args) => verify(args),
     }
 }
@@ -353,6 +452,9 @@ fn explain(s: Status) -> String {
         }
         Status::NoAdminChallenge => {
             "the proposal has expired or was already used (start a new one)"
+        }
+        Status::AuditFull => {
+            "the audit log is full; copy it out first with `quorum audit pull --log <file>`"
         }
     };
     format!("DENIED by HSM: {why}")
@@ -514,6 +616,29 @@ fn describe_op(serial: &[u8; 16], op: &AdminOp<'_>) -> Vec<String> {
             lines
         }
         AdminOp::DeleteAgentKey { key } => vec![format!("Delete agent key {key} on HSM {hsm}")],
+        AdminOp::UpdatePolicy { key, policy } => {
+            let mut lines = vec![format!(
+                "Change the rules of agent key {key} on HSM {hsm} to:"
+            )];
+            lines.extend(
+                describe_policy(policy)
+                    .into_iter()
+                    .map(|l| format!("  {l}")),
+            );
+            lines.push("  (money already spent still counts against the new budget)".into());
+            lines
+        }
+        AdminOp::ChangeAdmins { admins } => {
+            let mut lines = vec![format!(
+                "Replace the admins on HSM {hsm}: from now on {} of these {} must agree:",
+                admins.threshold(),
+                admins.keys().len()
+            )];
+            for (i, k) in admins.keys().iter().enumerate() {
+                lines.push(format!("  new admin #{i}: {}", hex(k)));
+            }
+            lines
+        }
     }
 }
 
@@ -601,24 +726,45 @@ fn new_key_file(out: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
+impl RuleArgs {
+    fn policy(&self) -> Result<Policy> {
+        let confirmer = self
+            .confirmer
+            .as_deref()
+            .map(read_hex_file::<32>)
+            .transpose()?;
+        let policy = Policy {
+            allowed: kinds_mask(&self.allow)?,
+            max_amount: parse_dollars(&self.max_amount)?,
+            budget: parse_dollars(&self.budget)?,
+            confirm_above: parse_dollars(&self.confirm_above)?,
+            always_confirm: kinds_mask(&self.always_confirm)?,
+            confirmer,
+            require_nonce: self.require_request,
+        };
+        policy
+            .validate()
+            .map_err(|_| "those rules are not valid".to_string())?;
+        Ok(policy)
+    }
+}
+
+fn show_current_rules(key: u32) -> Result<()> {
+    let mut hsm = Hsm::connect()?;
+    let kp =
+        resp::KeyPolicy::decode(&hsm.call(Request::GetKeyPolicy { key })?).map_err(bad_reply)?;
+    println!(
+        "Agent key {key} today ({} spent so far):",
+        dollars(kp.spent)
+    );
+    for line in describe_policy(&kp.policy) {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
 fn propose_create(args: ProposeCreateArgs) -> Result<()> {
-    let confirmer = args
-        .confirmer
-        .as_deref()
-        .map(read_hex_file::<32>)
-        .transpose()?;
-    let policy = Policy {
-        allowed: kinds_mask(&args.allow)?,
-        max_amount: parse_dollars(&args.max_amount)?,
-        budget: parse_dollars(&args.budget)?,
-        confirm_above: parse_dollars(&args.confirm_above)?,
-        always_confirm: kinds_mask(&args.always_confirm)?,
-        confirmer,
-        require_nonce: args.require_request,
-    };
-    policy
-        .validate()
-        .map_err(|_| "those rules are not valid".to_string())?;
+    let policy = args.rules.policy()?;
     let op = AdminOp::CreateAgentKey {
         label: args.label.as_bytes(),
         ext_id: b"",
@@ -737,8 +883,183 @@ fn submit(
             hsm.call(Request::DeleteAgentKey { key, approvals })?;
             println!("Deleted agent key {key}");
         }
+        AdminOp::UpdatePolicy { key, policy } => {
+            let payload = hsm.call(Request::UpdatePolicy {
+                key,
+                policy,
+                approvals,
+            })?;
+            let (cert, sig) = resp::decode_cert(&payload).map_err(bad_reply)?;
+            let c = KeyCert::decode(cert).map_err(bad_reply)?;
+            println!(
+                "Changed the rules of agent key {key} (now version {})",
+                c.version
+            );
+            if let Some(out) = cert_out {
+                write_cert(out, cert, &sig)?;
+            }
+        }
+        AdminOp::ChangeAdmins { admins } => {
+            hsm.call(Request::ChangeAdmins { admins, approvals })?;
+            println!(
+                "Admins replaced: {} of {} must now agree",
+                admins.threshold(),
+                admins.keys().len()
+            );
+        }
     }
     Ok(())
+}
+
+// ---- audit log -----------------------------------------------------------------
+
+fn read_log(path: &Path) -> Result<Vec<[u8; ENTRY_LEN]>> {
+    let data = match fs::read(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    if data.len() % ENTRY_LEN != 0 {
+        return Err(format!("{}: not an audit log file", path.display()));
+    }
+    Ok(data
+        .chunks_exact(ENTRY_LEN)
+        .filter_map(|c| c.try_into().ok())
+        .collect())
+}
+
+/// Copies new entries out, makes sure they are on disk, and only then lets
+/// the HSM release them.
+fn audit_pull(log: &Path) -> Result<()> {
+    let have = read_log(log)?.len() as u64;
+    let mut hsm = Hsm::connect()?;
+    let payload = hsm.call(Request::ReadAudit { from: have + 1 })?;
+    let batch = resp::AuditBatch::decode(&payload).map_err(bad_reply)?;
+    let new: Vec<_> = batch.entries().collect();
+    if let Some(first) = new.first() {
+        let seq = Entry::decode(&first[..]).map_err(bad_reply)?.seq;
+        if seq != have + 1 {
+            return Err(format!(
+                "MISSING entries {} to {}: the HSM no longer holds them (someone released them without saving)",
+                have + 1,
+                seq - 1
+            ));
+        }
+    } else if batch.last_seq > have {
+        return Err(format!(
+            "MISSING entries {} to {}: the HSM no longer holds them",
+            have + 1,
+            batch.last_seq
+        ));
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|e| format!("opening {}: {e}", log.display()))?;
+    for e in &new {
+        f.write_all(&e[..]).map_err(|e| e.to_string())?;
+    }
+    f.sync_all().map_err(|e| e.to_string())?;
+    hsm.call(Request::AckAudit {
+        upto: batch.last_seq,
+    })?;
+    println!(
+        "Copied {} new audit entries to {} ({} in total)",
+        new.len(),
+        log.display(),
+        have + new.len() as u64
+    );
+    Ok(())
+}
+
+fn audit_checkpoint(out: &Path) -> Result<()> {
+    let payload = Hsm::connect()?.call(Request::AuditCheckpoint)?;
+    let (cp, sig) = resp::decode_checkpoint(&payload).map_err(bad_reply)?;
+    write_file(out, cp)?;
+    write_file(&with_ext(out, ".sig"), &sig)?;
+    let c = Checkpoint::decode(cp).map_err(bad_reply)?;
+    println!(
+        "Checkpoint saved to {}: the HSM vouches for entries 1 to {}",
+        out.display(),
+        c.seq
+    );
+    Ok(())
+}
+
+fn audit_verify(identity: &Path, log: &Path, checkpoint: &Path) -> Result<()> {
+    let identity = read_hex_file::<32>(identity)?;
+    let entries = read_log(log)?;
+    let cp = read_file(checkpoint)?;
+    let sig = sig64(&read_file(&with_ext(checkpoint, ".sig"))?)?;
+    match verify_log(&identity, &cp, &sig, &entries) {
+        Ok(c) => {
+            println!(
+                "VALID: entries 1 to {} are complete and unaltered (signed by HSM {})",
+                c.seq,
+                String::from_utf8_lossy(&c.serial)
+            );
+            if entries.len() as u64 > c.seq {
+                println!(
+                    "  {} newer entries are not covered by this checkpoint yet",
+                    entries.len() as u64 - c.seq
+                );
+            }
+            Ok(())
+        }
+        Err(LogError::BadCheckpoint) => {
+            Err("INVALID: the checkpoint was not signed by this HSM".into())
+        }
+        Err(LogError::BrokenAt(seq)) => Err(format!(
+            "INVALID: the log breaks at entry {seq} (entries were removed, added or reordered)"
+        )),
+        Err(LogError::TooShort { have, need }) => Err(format!(
+            "INVALID: the log stops at entry {have}, but the HSM signed for {need} (entries were removed from the end)"
+        )),
+        Err(LogError::HeadMismatch) => Err(
+            "INVALID: the entries don't match what the HSM signed (an entry was changed)".into(),
+        ),
+    }
+}
+
+fn audit_show(log: &Path) -> Result<()> {
+    for bytes in read_log(log)? {
+        let e = Entry::decode(&bytes[..]).map_err(bad_reply)?;
+        let what = match e.event {
+            Event::Provisioned => "HSM created at the factory".to_string(),
+            Event::LoginOk => "logged in".to_string(),
+            Event::LoginFailed => "wrong PIN".to_string(),
+            Event::KeyCreated => format!("key {} created", e.key),
+            Event::KeyDeleted => format!("key {} deleted", e.key),
+            Event::AgentKeyCreated => format!("agent key {} created (admins approved)", e.key),
+            Event::AgentKeyDeleted => format!("agent key {} deleted (admins approved)", e.key),
+            Event::PolicyUpdated => format!("agent key {} rules changed (admins approved)", e.key),
+            Event::AdminsChanged => "admins replaced (previous admins approved)".to_string(),
+            Event::ActionApproved => {
+                format!(
+                    "agent key {}: action approved ({})",
+                    e.key,
+                    dollars(e.amount)
+                )
+            }
+            Event::ActionRefused => format!(
+                "agent key {}: action REFUSED ({}): {}",
+                e.key,
+                dollars(e.amount),
+                refusal(e.status)
+            ),
+            Event::AdminRequestRefused => format!("admin request REFUSED: {}", refusal(e.status)),
+        };
+        println!("#{:<5} {what}", e.seq);
+    }
+    Ok(())
+}
+
+fn refusal(status: u8) -> String {
+    match Status::try_from(status) {
+        Ok(s) => explain(s).trim_start_matches("DENIED by HSM: ").to_string(),
+        Err(_) => format!("status {status}"),
+    }
 }
 
 fn write_cert(out: &Path, cert: &[u8], sig: &[u8; 64]) -> Result<()> {
@@ -959,8 +1280,9 @@ fn verify(args: VerifyArgs) -> Result<()> {
         String::from_utf8_lossy(&s.serial)
     );
     println!(
-        "  agent key:   {} (created with sign-off from admins {})",
+        "  agent key:   {} (rules version {}, approved by admins {})",
         c.key,
+        c.version,
         approvers(c.approvers)
     );
     println!("  action #:    {}", s.sequence);

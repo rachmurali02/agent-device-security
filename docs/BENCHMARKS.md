@@ -1,10 +1,10 @@
 # Benchmarks: is enforcing rules inside the HSM the right approach?
 
 **Short answer:** yes, for our threat (someone controls the computer and knows
-the PIN). It's the only option tested that blocks the attacks. It costs about
-**0.3–0.5 milliseconds more per agent action** than the conventional setup on
-this machine, and almost all of that is *saving to disk safely*, not the rules
-themselves.
+the PIN). It's the only option tested that blocks the attacks: **8 of 8**,
+against 1 of 8 for the conventional setup. It costs about **0.35–0.6
+milliseconds more per agent action** on this machine. Almost all of that is
+*saving to disk safely*; the rules themselves cost microseconds.
 
 ![Benchmark comparison chart of quorum-hsm and SoftHSM2](benchmarks/comparison.svg)
 
@@ -28,6 +28,9 @@ To keep the comparison fair:
 - **Same rules.** The SoftHSM2 setup checks exactly the same rules, using our
   own rule code, so the only difference is *where* the check runs.
 - **No logging** in our emulator during timing (printing to the screen slowed it down).
+- **The audit log is included.** Our HSM keeps at most 64 log entries and
+  stops when full, so the benchmark acts as an audit collector: it copies the
+  log out every 16 requests, and that time is counted.
 
 ## How to run it
 
@@ -48,32 +51,34 @@ target/release/quorum-bench --softhsm /path/to/other_pkcs11.so
 ## Results
 
 Machine: Intel Xeon @ 2.10GHz, 4 cores, cloud VM. "Median" is the typical
-time for one operation. We ran the benchmark three times; the ranges below
-cover all three runs (most numbers moved by about ±10% between runs; key
-creation moved more). Full output from one run:
-[`benchmarks/results.md`](benchmarks/results.md); raw numbers from all three:
-[`benchmarks/runs/`](benchmarks/runs/).
+time for one operation. The ranges cover all three runs. Full output from one
+run is in [`benchmarks/results.md`](benchmarks/results.md); raw numbers from
+all three are in [`benchmarks/runs/`](benchmarks/runs/).
 
 ### Speed
 
 | What | quorum-hsm | SoftHSM2 | No HSM |
 |---|---:|---:|---:|
-| Sign a message (median) | **108–118 µs** | 196–206 µs | 17 µs |
-| Create a key (median) | **1.3–2.2 ms** | 11.6–12.4 ms | n/a |
-| Approve an agent action, saved safely to disk | 710–746 µs | 450–485 µs ¹ | n/a |
-| Approve an agent action, *not* saved safely (unsafe) | 265–281 µs | 203–209 µs ¹ | n/a |
-| Approve an action that needs the user's OK | 0.91–0.95 ms | not possible ² | n/a |
-| Create an agent key with 2-of-3 admin sign-off + certificate, then delete it | 2.1–2.9 ms | not possible ² | n/a |
-| Receiver checks a signed action (no HSM needed) | 128–142 µs | n/a | n/a |
-| Signatures per second, 1 thread → 4 threads | ~7,900 → ~6,500 | ~4,700 → ~8,600 | n/a |
+| Sign a message (median) | **126–136 µs** | 198–235 µs | 17 µs |
+| Create a key (median) | **1.5–1.7 ms** | 10.1–12.2 ms | n/a |
+| Approve an agent action, saved safely to disk | 819–825 µs | 434–460 µs ¹ | n/a |
+| Approve an agent action, *not* saved safely (unsafe) | 291–369 µs | 207–214 µs ¹ | n/a |
+| Approve an action that needs the user's OK | 0.98–1.13 ms | not possible ² | n/a |
+| **Refuse** an action (the refusal is recorded and saved) | 696–914 µs | <1 µs, nothing recorded ¹ | n/a |
+| Create an agent key with 2-of-3 sign-off + certificate, then delete it | 2.2–3.0 ms | not possible ² | n/a |
+| Change an agent key's rules with 2-of-3 sign-off + new certificate | 1.1–1.5 ms | not possible ² | n/a |
+| Receiver checks a signed action (no HSM needed) | 125–127 µs | n/a | n/a |
+| Auditor checks a 1,000-entry log against a checkpoint (no HSM needed) | 226–228 µs | not possible ² | n/a |
+| Signatures per second, 1 thread → 4 threads | ~8,500 → ~6,300 | ~4,900 → ~8,100 | n/a |
 
 ¹ The rules run on the computer, so these are the steps an attacker can skip (see below).
 ² SoftHSM2 has no way to do this inside the HSM.
 
 ### Security: attacks we actually ran
 
-These aren't claims. The benchmark runs each attack and reports what happened.
-The attacker controls the computer and knows the PIN.
+These aren't claims. The benchmark runs each attack and reports what happened,
+and it fails if any attack ever gets through against quorum-hsm. The attacker
+controls the computer and knows the PIN. All three runs gave the same result.
 
 | Attack | quorum-hsm | SoftHSM2 + rules on the computer |
 |---|---|---|
@@ -83,41 +88,71 @@ The attacker controls the computer and knows the PIN.
 | Reset the budget by deleting and re-creating the key | ✅ blocked: needs admins | ❌ works: the counter is just a file |
 | Read the private key out of the HSM | ✅ blocked | ✅ blocked |
 | Fool a receiver about which rules approved a signature | ✅ blocked: the birth certificate proves it | ❌ works: nothing ties a key to its rules |
+| **Loosen an existing key's rules using only the PIN** | ✅ blocked: needs 2 of 3 admins; the $3 budget still holds | ❌ works: the attacker edits the host's rules |
+| **Erase the record of a refused attack** | ✅ blocked: editing or deleting the entry breaks the HSM-signed checkpoint | ❌ works: the log line is deleted and nothing can tell |
 
-**quorum-hsm blocks 6 of 6. SoftHSM2 used the conventional way blocks 1 of 6.**
+**quorum-hsm blocks 8 of 8. SoftHSM2 used the conventional way blocks 1 of 8.**
 SoftHSM2 still protects the key itself; it just signs whatever it's asked to.
 
 ## What the numbers mean
 
 1. **The rules are almost free.** Inside the core, approving an agent action
-   takes 53 µs against 33 µs for a plain signature. Reading the action,
-   checking every rule and building the statement adds about **20 µs**.
+   takes 55 µs against 33 µs for a plain signature. Reading the action,
+   checking every rule, building the statement and writing the audit entry
+   add about **20 µs**. A refusal is even cheaper (11 µs), since nothing is signed.
 
 2. **Saving safely to disk is the real cost.** An agent action takes about
-   280 µs without waiting for the disk and 710–750 µs with it. Waiting is
-   what guarantees a power cut can't hand out a free signature, so it's not
+   290–370 µs without waiting for the disk and about 820 µs with it. Waiting
+   is what guarantees a power cut can't hand out a free signature, so it's not
    optional. The conventional setup pays for this too *if* it saves its
    counters carefully, and it can still be cheated (see the security table).
 
-3. **Our disk saving can be about twice as fast.** Each action rewrites the
-   whole state file and waits for the disk *twice* (once for the file, once
-   for the folder). Appending only the changed counters to a log would wait
-   once and write far less. On real hardware, built-in counters that only go
-   up (in secure chips or eMMC "RPMB" storage) would do the same job.
+3. **Refusals now cost about as much as approvals.** A refused action is
+   written to the audit log and saved *before* the HSM answers, so there is
+   no way to probe the rules without leaving a trace. The flip side: someone
+   with the PIN can make the HSM do a disk write per refusal, which is a way
+   to slow it down. People without the PIN can't (see the README).
 
-4. **Crossing into the HSM costs more than the maths.** A signature takes
-   17 µs on its own but 108–118 µs through PKCS#11 and the socket. Our
+4. **Rare admin work is cheap enough not to matter.** Changing a key's rules
+   with two admin signatures and a new certificate takes about 1.5 ms. An
+   auditor can check a 1,000-entry log in a quarter of a millisecond, on
+   any computer.
+
+5. **Our disk saving can be about twice as fast.** Each change rewrites the
+   whole state file and waits for the disk *twice* (once for the file, once
+   for the folder). The state file also got bigger in milestone 3, since it
+   holds up to 64 audit entries. Appending only what changed to a journal
+   would wait once and write far less. On real hardware, counters that only
+   go up (in secure chips or eMMC "RPMB" storage) would do the same job.
+
+6. **Crossing into the HSM costs more than the maths.** A signature takes
+   17 µs on its own but about 130 µs through PKCS#11 and the socket. Our
    adapter also asks the HSM for its key list before every signature: one
    extra round trip that a small cache would remove.
 
-5. **SoftHSM2 handles parallel requests better.** It gets faster with 4
+7. **SoftHSM2 handles parallel requests better.** It gets faster with 4
    threads; we don't, because our HSM does one command at a time (like a
-   single-core secure chip) and the adapter shares one connection. On real
-   hardware the chip would be the limit anyway, but it matters if this were
-   a busy server.
+   single-core secure chip) and the adapter shares one connection.
 
-6. **Key creation is faster here** (1.3–2.2 ms against about 12 ms), mostly because
-   SoftHSM2 encrypts and writes a separate file for every key.
+8. **Key creation is faster here** (about 1.6 ms against about 11 ms), mostly
+   because SoftHSM2 encrypts and writes a separate file for every key.
+
+### What changed since milestone 2
+
+Same benchmark, before and after adding the audit log and rule/admin changes.
+The machine was restarted between the two measurements, so treat changes
+under ~15% as possibly just the machine.
+
+| What | Milestone 2 | Milestone 3 | Why |
+|---|---:|---:|---|
+| Approve an agent action, saved safely | ~729 µs | ~821 µs | Bigger state file (audit entries), plus the collector's "release" step is itself a saved write every 16 actions |
+| …without waiting for the disk | ~277 µs | ~368 µs | Same reasons, minus the waiting |
+| Rule check inside the core | ~53 µs | ~55 µs | Writing the audit entry costs ~2 µs |
+| Sign a message via PKCS#11 | ~115 µs | ~130 µs | Raw signing does no audit work; likely the machine |
+| Attacks blocked | 6 of 6 | **8 of 8** | Two new attacks, both blocked |
+
+The audit log costs roughly **+10–15% per agent action**, all of it in disk
+writes. Point 5 above would more than win that back.
 
 ## Other kinds of HSM
 
@@ -140,12 +175,13 @@ real hardware is the way to fill in the speed column for these.
 
 ## Verdict
 
-- **For security against a hacked computer:** the rules must be enforced
-  inside the HSM. The conventional setup can't stop an attacker who skips the
-  check. That's the main finding, and the attack table shows it directly.
+- **For security against a hacked computer:** the rules, the admin sign-off
+  and the audit log must all live inside the HSM. The conventional setup can't
+  stop an attacker who skips a check, edits the rules or deletes a log line.
+  The attack table shows each of these directly.
 - **For speed:** the approach costs a few hundred microseconds per action,
-  dominated by safe saving. That's tiny next to a person tapping "Approve"
-  or a network payment, and it can be roughly halved (point 3).
+  dominated by safe saving. That's tiny next to a person tapping "Approve" or
+  a network payment, and it can be roughly halved (point 5).
 - **For production:** run this same core on hardware that accepts custom code
   (a TEE, a secure microcontroller, or a commercial HSM with a firmware SDK).
   Fixed-function HSMs and cloud HSMs can't host the rules.

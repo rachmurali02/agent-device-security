@@ -35,6 +35,7 @@ use quorum_core::admin::{AdminOp, Approvals, MAX_PROPOSAL, Proposal};
 use quorum_core::agent::{
     Action, ActionKind, CONFIRM_MESSAGE_MAX, MAX_STATEMENT, Policy, Statement, confirmation_message,
 };
+use quorum_core::audit::{ENTRY_LEN, verify_log};
 use quorum_core::cert::verify_action;
 use quorum_core::wire::{MAX_FRAME, Request, Status, Writer, resp};
 use quorum_core::{Hsm, Provisioning, Session as HsmSession, Storage, StorageError};
@@ -272,10 +273,33 @@ fn start_emulator(dir: &Path, name: &str, sync: bool) -> Emulator {
     Emulator { socket }
 }
 
+/// Copies the audit log out and releases it, as an audit collector does.
+/// The HSM holds at most 64 entries and refuses to act when full, so every
+/// benchmark that makes audited calls collects as it goes (and pays for it).
+fn collect(c: &mut Client) {
+    let (_, p) = c.call(&Request::ReadAudit { from: 0 }).expect("hsm io");
+    let batch = resp::AuditBatch::decode(&p).unwrap();
+    std::hint::black_box(batch.entries().count());
+    let (st, _) = c
+        .call(&Request::AckAudit {
+            upto: batch.last_seq,
+        })
+        .expect("hsm io");
+    assert_eq!(st, Status::Ok);
+}
+
+fn drain(e: &Emulator) {
+    collect(&mut Client::connect_at(&e.socket).expect("connect"));
+}
+
+/// How often (in requests) benchmarks copy the audit log out.
+const COLLECT_EVERY: u32 = 16;
+
 /// Talks to an emulator directly, the way `quorum` (the CLI) does.
 struct Direct {
     c: Client,
     serial: [u8; 16],
+    calls: u32,
 }
 
 impl Direct {
@@ -289,11 +313,52 @@ impl Direct {
         assert_eq!(s, Status::Ok);
         let (_, p) = c.call(&Request::GetIdentity).unwrap();
         let serial = resp::Identity::decode(&p).unwrap().serial;
-        Direct { c, serial }
+        Direct {
+            c,
+            serial,
+            calls: 0,
+        }
     }
 
     fn call(&mut self, req: Request<'_>) -> (Status, Vec<u8>) {
-        self.c.call(&req).expect("hsm io")
+        let mut r = self.c.call(&req).expect("hsm io");
+        // With several connections, the log can fill between our own
+        // collections. A collector reacts to that, and the request is retried.
+        if r.0 == Status::AuditFull {
+            collect(&mut self.c);
+            r = self.c.call(&req).expect("hsm io");
+        }
+        self.calls += 1;
+        if self.calls.is_multiple_of(COLLECT_EVERY) {
+            collect(&mut self.c);
+        }
+        r
+    }
+
+    /// Changes an agent key's rules with 2-of-3 admin sign-off.
+    fn update_policy(&mut self, key: u32, policy: Policy) -> (Status, Vec<u8>) {
+        let (_, p) = self.call(Request::GetAdminChallenge);
+        let challenge = resp::decode_challenge(&p).unwrap();
+        let op = AdminOp::UpdatePolicy { key, policy };
+        let mut buf = [0u8; MAX_PROPOSAL];
+        let n = Proposal {
+            serial: self.serial,
+            challenge,
+            op,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        let mut approvals = Approvals::default();
+        for i in 0..2 {
+            approvals
+                .push(i as u8, admins()[i].sign(&buf[..n]).to_bytes())
+                .unwrap();
+        }
+        self.call(Request::UpdatePolicy {
+            key,
+            policy,
+            approvals,
+        })
     }
 
     /// Creates an agent key with 2-of-3 admin sign-off.
@@ -516,7 +581,7 @@ fn main() {
     unsafe { std::env::set_var("QUORUM_HSM_SOCKET", &safe.socket) };
 
     eprintln!("1/5 signing...");
-    signing(&mut report, &cfg, have_softhsm);
+    signing(&mut report, &cfg, &safe, have_softhsm);
     eprintln!("2/5 key creation...");
     key_creation(&mut report, &cfg, &safe, have_softhsm);
     eprintln!("3/5 agent actions...");
@@ -566,7 +631,7 @@ fn environment(out: &mut String, cfg: &Config) {
     .unwrap();
 }
 
-fn signing(out: &mut String, cfg: &Config, have_softhsm: bool) {
+fn signing(out: &mut String, cfg: &Config, safe: &Emulator, have_softhsm: bool) {
     let n = cfg.iterations;
     let mut rows = Vec::new();
 
@@ -626,6 +691,7 @@ fn signing(out: &mut String, cfg: &Config, have_softhsm: bool) {
         },
     ));
 
+    drain(safe);
     let q = open_module(&cfg.quorum_module);
     let s = session(&q, true);
     let (_, privh) = generate(&s, "bench").expect("quorum keygen");
@@ -653,6 +719,7 @@ fn key_creation(out: &mut String, cfg: &Config, safe: &Emulator, have_softhsm: b
     let n = (cfg.iterations / 50).clamp(5, 12);
     let mut rows = Vec::new();
 
+    drain(safe);
     let q = open_module(&cfg.quorum_module);
     let s = session(&q, true);
     let mut i = 0;
@@ -662,6 +729,10 @@ fn key_creation(out: &mut String, cfg: &Config, safe: &Emulator, have_softhsm: b
         n,
         || {
             i += 1;
+            // Each key creates and deletes two audit entries.
+            if i % 8 == 0 {
+                drain(safe);
+            }
             let (pubh, _) = generate(&s, &format!("k{i}")).unwrap();
             s.destroy_object(pubh).unwrap();
         },
@@ -702,6 +773,23 @@ fn key_creation(out: &mut String, cfg: &Config, safe: &Emulator, have_softhsm: b
         },
     ));
     rows.last_mut().unwrap().name += " (create + delete pair)";
+
+    let (st, p) = d.create_agent_key(bench_policy());
+    assert_eq!(st, Status::Ok);
+    let key = resp::AgentKeyCreated::decode(&p).unwrap().key;
+    let mut flip = false;
+    rows.push(measure(
+        "quorum-hsm: change an agent key's rules with 2-of-3 sign-off + new certificate",
+        n * 4,
+        || {
+            flip = !flip;
+            let policy = Policy {
+                budget: if flip { u64::MAX / 2 } else { u64::MAX / 3 },
+                ..bench_policy()
+            };
+            assert_eq!(d.update_policy(key, policy).0, Status::Ok);
+        },
+    ));
 
     if have_softhsm {
         let p = open_module(&cfg.softhsm_module);
@@ -749,9 +837,28 @@ fn agent_actions(
         "quorum-hsm core, in process (no socket, no disk)",
         n,
         || {
-            d_inproc.raw(&req[..k]);
+            d_inproc.act(&req[..k]);
         },
     ));
+    let too_much = Action {
+        amount: 101,
+        ..payment()
+    };
+    let k2 = Request::SignAction {
+        key,
+        action: too_much,
+        confirmation: None,
+    }
+    .encode(&mut req)
+    .unwrap();
+    rows.push(measure(
+        "quorum-hsm core, refusing an action (refusal recorded, no disk)",
+        n,
+        || {
+            d_inproc.act(&req[..k2]);
+        },
+    ));
+    drop(d_inproc);
 
     for (emu, name) in [
         (
@@ -770,6 +877,15 @@ fn agent_actions(
         rows.push(measure(name, n, || {
             assert_eq!(d.sign_action(key, payment()), Status::Ok);
         }));
+        if emu.socket == safe.socket {
+            rows.push(measure(
+                "quorum-hsm emulator, refusing an action (refusal recorded in the audit log, saved with fsync)",
+                n,
+                || {
+                    assert_eq!(d.sign_action(key, too_much), Status::AmountTooHigh);
+                },
+            ));
+        }
     }
 
     let mut d = Direct::connect(safe);
@@ -807,6 +923,19 @@ fn agent_actions(
                 assert!(host.approve(&s, privh, &payment()));
             }));
         }
+        let mut host = HostPolicy {
+            policy: bench_policy(),
+            spent: 0,
+            sequence: 0,
+            persist: None,
+        };
+        rows.push(measure(
+            "SoftHSM2 + rules on the host, refusing an action (nothing recorded)",
+            n,
+            || {
+                assert!(!host.approve(&s, privh, &too_much));
+            },
+        ));
         drop(s);
         p.finalize().ok();
     }
@@ -834,11 +963,74 @@ fn agent_actions(
         },
     ));
 
+    // The auditor's side: a 1,000-entry log checked against a checkpoint.
+    let (log, cp, cp_sig, identity) = audit_log_of(1000);
+    rows.push(measure(
+        "Auditor check: 1,000-entry audit log against a signed checkpoint (no HSM)",
+        (n / 20).max(20),
+        || {
+            verify_log(&identity, &cp, &cp_sig, &log).unwrap();
+        },
+    ));
+
     table(
         out,
         "3. Approving one agent action (\"pay $0.01 to shop.example\")",
         &rows,
     );
+}
+
+/// Builds an in-process HSM, makes it record at least `n` audit entries
+/// (keeping every one, as a careful collector would), and returns the full
+/// log, a signed checkpoint and the HSM identity.
+fn audit_log_of(n: usize) -> (Vec<[u8; ENTRY_LEN]>, Vec<u8>, [u8; 64], [u8; 32]) {
+    let mut storage = MemStorage::default();
+    let mut hsm = provision(&mut storage);
+    let identity = hsm.identity_public();
+    let mut sess = HsmSession::default();
+    let mut p = InProcess::new(&mut hsm, &mut sess, &mut storage);
+    p.keep = Some(Vec::new());
+    let key = p.agent_key();
+    let mut req = [0u8; MAX_FRAME];
+    let k = Request::SignAction {
+        key,
+        action: payment(),
+        confirmation: None,
+    }
+    .encode(&mut req)
+    .unwrap();
+    while p.keep.as_ref().unwrap().len() < n {
+        p.act(&req[..k]);
+    }
+    p.collect();
+    let out = p.call(Request::AuditCheckpoint);
+    let (cp, sig) = resp::decode_checkpoint(&out[1..]).unwrap();
+    (p.keep.take().unwrap(), cp.to_vec(), sig, identity)
+}
+
+/// A complete audit log containing one approved and one refused payment.
+fn audit_log_with_refusal() -> (Vec<[u8; ENTRY_LEN]>, Vec<u8>, [u8; 64], [u8; 32]) {
+    let mut storage = MemStorage::default();
+    let mut hsm = provision(&mut storage);
+    let identity = hsm.identity_public();
+    let mut sess = HsmSession::default();
+    let mut p = InProcess::new(&mut hsm, &mut sess, &mut storage);
+    p.keep = Some(Vec::new());
+    let key = p.agent_key();
+    for amount in [1, 999_999] {
+        p.call(Request::SignAction {
+            key,
+            action: Action {
+                amount,
+                ..payment()
+            },
+            confirmation: None,
+        });
+    }
+    p.collect();
+    let out = p.call(Request::AuditCheckpoint);
+    let (cp, sig) = resp::decode_checkpoint(&out[1..]).unwrap();
+    (p.keep.take().unwrap(), cp.to_vec(), sig, identity)
 }
 
 /// Drives an in-process HSM core through its normal request/response API.
@@ -847,6 +1039,9 @@ struct InProcess<'a> {
     sess: &'a mut HsmSession,
     storage: &'a mut MemStorage,
     out: Box<[u8; MAX_FRAME]>,
+    calls: u32,
+    /// When set, collected audit entries are kept here.
+    keep: Option<Vec<[u8; ENTRY_LEN]>>,
 }
 
 impl<'a> InProcess<'a> {
@@ -856,6 +1051,8 @@ impl<'a> InProcess<'a> {
             sess,
             storage,
             out: Box::new([0; MAX_FRAME]),
+            calls: 0,
+            keep: None,
         };
         let mut req = [0u8; MAX_FRAME];
         let k = Request::Login {
@@ -878,6 +1075,26 @@ impl<'a> InProcess<'a> {
         let mut req = [0u8; MAX_FRAME];
         let k = r.encode(&mut req).unwrap();
         self.raw(&req[..k]).to_vec()
+    }
+
+    /// An audited request, collecting the log every `COLLECT_EVERY` calls.
+    fn act(&mut self, req: &[u8]) {
+        self.raw(req);
+        self.calls += 1;
+        if self.calls.is_multiple_of(COLLECT_EVERY) {
+            self.collect();
+        }
+    }
+
+    fn collect(&mut self) {
+        let out = self.call(Request::ReadAudit { from: 0 });
+        let batch = resp::AuditBatch::decode(&out[1..]).unwrap();
+        let last = batch.last_seq;
+        if let Some(keep) = &mut self.keep {
+            keep.extend(batch.entries().copied());
+        }
+        let out = self.call(Request::AckAudit { upto: last });
+        assert_eq!(out[0], Status::Ok as u8);
     }
 
     fn agent_key(&mut self) -> u32 {
@@ -1198,6 +1415,93 @@ fn attacks(out: &mut String, cfg: &Config, safe: &Emulator, have_softhsm: bool) 
     row(
         out,
         "Pass off a signature as approved under rules it wasn't (receiver's view)",
+        q,
+        s,
+    );
+
+    // 7. Loosen an existing key's rules (lift the budget) with only the PIN.
+    let looser = Policy {
+        budget: u64::MAX / 2,
+        max_amount: u64::MAX / 2,
+        ..bench_policy()
+    };
+    let st = d
+        .call(Request::UpdatePolicy {
+            key: agent.key,
+            policy: looser,
+            approvals: Approvals::default(),
+        })
+        .0;
+    let still_capped = d.sign_action(agent.key, dollar) == Status::BudgetExceeded;
+    let q = if matches!(st, Status::NoAdminChallenge | Status::QuorumRequired) && still_capped {
+        blocked("changing rules needs 2-of-3 admin sign-off; the $3 budget still holds")
+    } else {
+        works(&format!("{st:?}"))
+    };
+    let s = match &soft {
+        None => skip(),
+        Some((_, s, _, privh)) => {
+            // The host's rules are just data the attacker can edit.
+            let mut host = HostPolicy {
+                policy: Policy {
+                    budget: 300,
+                    ..bench_policy()
+                },
+                spent: 300,
+                sequence: 3,
+                persist: None,
+            };
+            host.policy = looser;
+            if host.approve(s, *privh, &dollar) {
+                works("the attacker edits the host's rules; the next $1 is signed")
+            } else {
+                blocked("refused")
+            }
+        }
+    };
+    row(
+        out,
+        "Loosen an existing key's rules (lift the budget) using only the PIN",
+        q,
+        s,
+    );
+
+    // 8. Hide a refused attack by editing the record afterwards.
+    let (mut log, cp, cp_sig, identity) = audit_log_with_refusal();
+    let refused = log
+        .iter()
+        .position(|e| {
+            quorum_core::audit::Entry::decode(e).unwrap().event
+                == quorum_core::audit::Event::ActionRefused
+        })
+        .expect("a refusal was recorded");
+    let mut e = quorum_core::audit::Entry::decode(&log[refused]).unwrap();
+    e.amount = 0;
+    log[refused] = e.encode();
+    let edited = verify_log(&identity, &cp, &cp_sig, &log).is_err();
+    log.remove(refused);
+    let removed = verify_log(&identity, &cp, &cp_sig, &log).is_err();
+    let q = if edited && removed {
+        blocked("editing or deleting the entry breaks the HSM-signed checkpoint")
+    } else {
+        works("log check still passed")
+    };
+    let s = match &soft {
+        None => skip(),
+        Some(_) => {
+            // A host-side log is a file the attacker can rewrite; there is
+            // nothing signed by the HSM to check it against.
+            let mut host_log = vec![
+                "approved pay $1 to shop".to_string(),
+                "REFUSED pay $9999.99 to attacker".to_string(),
+            ];
+            host_log.retain(|l| !l.starts_with("REFUSED"));
+            works("the line is deleted and nothing can tell")
+        }
+    };
+    row(
+        out,
+        "Erase the record of a refused attack from the audit log",
         q,
         s,
     );
