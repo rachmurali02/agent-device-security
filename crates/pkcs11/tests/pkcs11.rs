@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use cryptoki_sys::*;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use quorum_core::{Hsm, Provisioning};
-use quorum_emulator::{Device, FileStorage};
+use quorum_emulator::{Device, SlotStorage};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 const PIN: &[u8] = b"123456";
@@ -45,7 +45,7 @@ impl Token {
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("hsm.sock");
 
-        let mut storage = FileStorage::new(dir.join("hsm.state"));
+        let mut storage = SlotStorage::create(&dir.join("hsm.state")).unwrap();
         let hsm = Hsm::provision(
             Provisioning {
                 serial: *SERIAL_NO,

@@ -44,9 +44,10 @@ ADMIN_WORK = [
      "Auditor check: 1,000-entry audit log against a signed checkpoint (no HSM)"),
 ]
 BREAKDOWN = [
-    ("Rule check + signing only", "quorum-hsm core, in process (no socket, no disk)"),
-    ("+ socket and file write", "quorum-hsm emulator, fsync off (unsafe; shows cost of durability)"),
-    ("+ waiting for the disk", "quorum-hsm emulator, spending saved with fsync (safe default)"),
+    ("Rule check + signing", "quorum-hsm core, in process (no socket, no disk)"),
+    ("+ socket, file write", "quorum-hsm emulator, fsync off (unsafe; shows cost of durability)"),
+    ("+ 1 disk wait (now)", "quorum-hsm emulator, spending saved with fsync (safe default)"),
+    ("+ 2 disk waits (before)", "quorum-hsm emulator, previous storage (rewrite + rename, two disk waits)"),
 ]
 
 
@@ -232,7 +233,7 @@ def main(paths):
     panels.append(("Sign a message", "Median time in µs, lower is better", pair(SIGN, 0), "µs", None))
     panels.append(("Approve one agent action, saved safely", "Median time in µs, lower is better",
                    pair(ACTION, 0), "µs",
-                   "SoftHSM2 is faster, but its rule check runs on the computer and can be skipped."))
+                   "Both save to disk; SoftHSM2's rule check runs on the computer and can be skipped."))
     panels.append(("Create a key", "Median time in ms, lower is better",
                    pair(KEYGEN, 0, 1 / 1000), "ms", None))
 
@@ -259,9 +260,9 @@ def main(paths):
                    "Our emulator does one command at a time, like a single-core chip."))
     sec = ACTION[0]
     panels.append(("Where an agent action's time goes (quorum-hsm)",
-                   "Median time in µs; the rule check itself is a small part",
+                   "Median time in µs; two-slot storage needs one disk wait, not two",
                    [(label, "s1", series(data, sec, opt, 0), None) for label, opt in BREAKDOWN], "µs",
-                   "Most of the cost is making sure a power cut can't lose a counted payment."))
+                   "Disk waits make sure a power cut can't lose a counted payment."))
 
     panels.append(("Refuse an action", "Median time in µs, lower is better",
                    pair(REFUSE, 0), "µs",

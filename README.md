@@ -28,8 +28,8 @@ of them.
 **Does it work, and what does it cost?** We benchmarked it against SoftHSM2, the
 standard open-source HSM, used the conventional way, with the rules checked on
 the computer. We also ran eight attacks against both. **Ours blocked 8 of 8; the
-conventional setup blocked 1.** The price is a few hundred microseconds per
-action. Details in [Benchmarks](#benchmarks).
+conventional setup blocked 1.** A fully checked, logged and safely saved
+agent action takes about 0.28 ms. Details in [Benchmarks](#benchmarks).
 
 ## What works today
 
@@ -146,7 +146,7 @@ HSM checks, in order:  allowed kind? → under the per-payment limit? →
 - Signatures check out with OpenSSL, separate software that shares no code with this project.
 - The core code builds for a real $5 microcontroller chip (Raspberry Pi RP2350),
   not just for a PC.
-- 72 automated tests, two demo scripts that run everything from start to
+- 77 automated tests, two demo scripts that run everything from start to
   finish, and a benchmark that measures speed and runs attacks.
 
 ## Try it
@@ -288,6 +288,7 @@ $Q audit show --log audit.log
 | **A wrong-PIN attempt is saved *before* the PIN is checked.** | An attacker can't cut the power at the right moment to get unlimited guesses. |
 | **The PIN check takes the same time whether you're close or way off.** | Timing can't leak how many digits were right. |
 | **If saving fails, the HSM stops working** until it restarts. | It would rather refuse than continue in an unknown state ("fail closed"). |
+| **State is saved in two alternating slots, each with a hash.** | A power cut mid-save leaves the previous state intact; a test cuts a save off at every byte to prove it. |
 | **Deleted key numbers are never reused.** | An old reference can't accidentally point at a new key. |
 | **The core is written without `unsafe` code** and without needing an operating system. | Rust checks it for whole classes of memory bugs, and it can run on a tiny chip. |
 | **Every message from outside is checked strictly**: exact lengths, no extra bytes. | Malformed input is rejected instead of guessed at. |
@@ -357,21 +358,23 @@ each. The full report, with what the numbers mean, is in
 | | quorum-hsm (rules inside the HSM) | SoftHSM2 (rules on the computer) |
 |---|---|---|
 | Attacks blocked | **8 of 8** | 1 of 8 |
-| Sign a message | ~130 µs | ~200 µs |
-| Approve an agent action, saved safely | ~0.82 ms | ~0.46 ms (but an attacker can skip the rules) |
-| Refuse an action | ~0.7 ms (recorded in the audit log) | <1 µs (nothing recorded) |
-| Change a key's rules (2 of 3 admins) | ~1.5 ms | not possible |
-| Create a key | ~1.6 ms | ~11 ms |
+| Sign a message | ~110 µs | ~200 µs |
+| Approve an agent action, saved safely | **~0.28 ms** | ~0.47 ms (and an attacker can skip the rules) |
+| Refuse an action | ~0.18 ms (recorded in the audit log) | <1 µs (nothing recorded) |
+| Change a key's rules (2 of 3 admins) | ~0.8 ms | not possible |
+| Create a key | ~0.5 ms | ~12 ms |
 
 **What we learned:**
 
-- **The rules are almost free** (about 20 µs, audit entry included). Most of
-  the cost is saving to disk safely, so a power cut can't give away a free
+- **The rules are almost free** (about 20 µs, audit entry included). The
+  real cost is saving to disk safely, so a power cut can't give away a free
   signature.
-- The audit log added about 10–15% per action, all of it disk writes. The
-  saving could be made about twice as fast, which would more than pay for it.
-- A refusal is saved before the HSM answers, so it costs about as much as an
-  approval. That's the price of leaving no untraceable attempts.
+- **Two-slot storage made safe saving 2.7× faster.** Each save now
+  overwrites the older of two fixed slots and waits for the disk once,
+  instead of writing a new file and renaming it (two waits). A test cuts a
+  save off at every byte to prove a power cut can never corrupt the state.
+- A refusal is saved before the HSM answers. That costs a disk write, and
+  it's the price of leaving no untraceable attempts.
 - SoftHSM2 handles many requests at once better than our emulator does.
 
 Fixed-function HSMs, like most cloud HSMs and YubiHSM 2, can't run custom

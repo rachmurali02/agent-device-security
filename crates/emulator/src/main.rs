@@ -8,12 +8,13 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use quorum_core::Storage;
 use quorum_core::wire::SERIAL_LEN;
 use quorum_core::{Hsm, Provisioning};
-use quorum_emulator::{Device, FileStorage};
+use quorum_emulator::{Device, SLOT_FILE_LEN, SlotStorage};
 use rand_core::{OsRng, RngCore};
 
 fn main() -> ExitCode {
@@ -97,7 +98,8 @@ fn init(args: &[String]) -> Result<(), String> {
         None => return Err("--threshold is required with --admin".into()),
     };
 
-    let mut storage = FileStorage::new(path.clone());
+    let mut storage =
+        SlotStorage::create(&path).map_err(|e| format!("creating {}: {e}", path.display()))?;
     let hsm = Hsm::provision(
         Provisioning {
             serial,
@@ -131,11 +133,33 @@ fn init(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Opens the two-slot state file. A state file from before the slot format
+/// (one plain state) is converted once, atomically: the new file is fully
+/// written and saved before it replaces the old one.
+fn open_or_migrate(path: &Path) -> Result<(SlotStorage, Vec<u8>), String> {
+    let len = fs::metadata(path)
+        .map_err(|e| format!("reading {}: {e}", path.display()))?
+        .len();
+    if len != SLOT_FILE_LEN {
+        let old = fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        Hsm::load(&old)
+            .map_err(|e| format!("{}: not an HSM state file ({e:?})", path.display()))?;
+        let tmp = path.with_extension("migrating");
+        let mut slots = SlotStorage::create(&tmp).map_err(|e| e.to_string())?;
+        slots
+            .commit(&old)
+            .map_err(|_| "migration failed".to_string())?;
+        fs::rename(&tmp, path).map_err(|e| format!("migration failed: {e}"))?;
+        eprintln!("converted {} to the two-slot format", path.display());
+    }
+    SlotStorage::open(path).map_err(|e| format!("opening {}: {e}", path.display()))
+}
+
 fn serve(args: &[String]) -> Result<(), String> {
     let path = PathBuf::from(required(args, "--state")?);
     let socket = PathBuf::from(required(args, "--socket")?);
 
-    let state = fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let (mut storage, state) = open_or_migrate(&path)?;
     let hsm = Hsm::load(&state).map_err(|e| format!("loading state: {e:?}"))?;
     let serial = String::from_utf8_lossy(hsm.serial()).into_owned();
 
@@ -148,8 +172,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("chmod socket: {e}"))?;
     eprintln!("HSM {serial} listening on {}", socket.display());
 
-    let mut storage = FileStorage::new(path);
-    // Benchmarking only: see FileStorage::sync.
+    // Benchmarking only: see SlotStorage::sync.
     storage.sync = !args.iter().any(|a| a == "--no-fsync");
     if !storage.sync {
         eprintln!(

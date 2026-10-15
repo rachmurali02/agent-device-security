@@ -39,7 +39,7 @@ use quorum_core::audit::{ENTRY_LEN, verify_log};
 use quorum_core::cert::verify_action;
 use quorum_core::wire::{MAX_FRAME, Request, Status, Writer, resp};
 use quorum_core::{Hsm, Provisioning, Session as HsmSession, Storage, StorageError};
-use quorum_emulator::{Device, FileStorage};
+use quorum_emulator::{Device, RenameStorage, SlotStorage};
 use rand_core::OsRng;
 
 const PIN: &str = "123456";
@@ -263,13 +263,36 @@ struct Emulator {
     socket: PathBuf,
 }
 
-fn start_emulator(dir: &Path, name: &str, sync: bool) -> Emulator {
+/// How an emulator saves its state.
+#[derive(Clone, Copy)]
+enum Store {
+    /// Two-slot storage (the default): one wait for the disk per save.
+    Slots { sync: bool },
+    /// The previous design: rewrite + rename, two waits per save.
+    Rename,
+}
+
+fn start_emulator(dir: &Path, name: &str, store: Store) -> Emulator {
     let socket = dir.join(format!("{name}.sock"));
-    let mut storage = FileStorage::new(dir.join(format!("{name}.state")));
-    storage.sync = sync;
-    let hsm = provision(&mut storage);
+    let path = dir.join(format!("{name}.state"));
     let listener = UnixListener::bind(&socket).expect("bind");
-    thread::spawn(move || quorum_emulator::serve_with(listener, Device { hsm, storage }, false));
+    match store {
+        Store::Slots { sync } => {
+            let mut storage = SlotStorage::create(&path).expect("slot file");
+            storage.sync = sync;
+            let hsm = provision(&mut storage);
+            thread::spawn(move || {
+                quorum_emulator::serve_with(listener, Device { hsm, storage }, false)
+            });
+        }
+        Store::Rename => {
+            let mut storage = RenameStorage::new(path);
+            let hsm = provision(&mut storage);
+            thread::spawn(move || {
+                quorum_emulator::serve_with(listener, Device { hsm, storage }, false)
+            });
+        }
+    }
     Emulator { socket }
 }
 
@@ -575,8 +598,9 @@ fn main() {
 
     // Emulators: the safe default (fsync) and an unsafe no-fsync variant
     // that shows how much of the cost is durability.
-    let safe = start_emulator(&dir, "safe", true);
-    let fast = start_emulator(&dir, "nofsync", false);
+    let safe = start_emulator(&dir, "safe", Store::Slots { sync: true });
+    let fast = start_emulator(&dir, "nofsync", Store::Slots { sync: false });
+    let before = start_emulator(&dir, "rename", Store::Rename);
     // Safe: no other thread reads the environment yet.
     unsafe { std::env::set_var("QUORUM_HSM_SOCKET", &safe.socket) };
 
@@ -585,7 +609,16 @@ fn main() {
     eprintln!("2/5 key creation...");
     key_creation(&mut report, &cfg, &safe, have_softhsm);
     eprintln!("3/5 agent actions...");
-    agent_actions(&mut report, n, &safe, &fast, &dir, have_softhsm, &cfg);
+    agent_actions(
+        &mut report,
+        n,
+        &safe,
+        &fast,
+        &before,
+        &dir,
+        have_softhsm,
+        &cfg,
+    );
     eprintln!("4/5 throughput...");
     concurrency(&mut report, &cfg, &safe, have_softhsm);
     eprintln!("5/5 attacks...");
@@ -813,6 +846,7 @@ fn agent_actions(
     n: usize,
     safe: &Emulator,
     fast: &Emulator,
+    before: &Emulator,
     dir: &Path,
     have_softhsm: bool,
     cfg: &Config,
@@ -868,6 +902,10 @@ fn agent_actions(
         (
             fast,
             "quorum-hsm emulator, fsync off (unsafe; shows cost of durability)",
+        ),
+        (
+            before,
+            "quorum-hsm emulator, previous storage (rewrite + rename, two disk waits)",
         ),
     ] {
         let mut d = Direct::connect(emu);

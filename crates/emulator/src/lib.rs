@@ -4,78 +4,35 @@
 //! host interface (on a real device, USB or SPI) and the state file stands in
 //! for the HSM's internal flash.
 
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use quorum_core::wire::{MAX_FRAME, Request, resp};
-use quorum_core::{Hsm, Session, Storage, StorageError};
+use quorum_core::{Hsm, Session, Storage};
 use rand_core::OsRng;
 
-/// Atomic file-backed storage: write a temp file, fsync, rename over the old
-/// state, fsync the directory. A crash leaves either the old or new state.
-pub struct FileStorage {
-    pub path: PathBuf,
-    /// Wait for the disk to confirm every write (fsync). Turning this off is
-    /// only for measuring what durability costs: a power cut could then lose
-    /// a counter update, which is exactly what the HSM must never allow.
-    pub sync: bool,
-}
+mod storage;
+pub use storage::{RenameStorage, SLOT_FILE_LEN, SlotStorage};
 
-impl FileStorage {
-    pub fn new(path: PathBuf) -> Self {
-        FileStorage { path, sync: true }
-    }
-}
-
-impl FileStorage {
-    fn write_atomic(&self, state: &[u8]) -> io::Result<()> {
-        let tmp = self.path.with_extension("tmp");
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(state)?;
-        if self.sync {
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)?;
-        if !self.sync {
-            return Ok(());
-        }
-        let dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
-        File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
-    }
-}
-
-impl Storage for FileStorage {
-    fn commit(&mut self, state: &[u8]) -> Result<(), StorageError> {
-        self.write_atomic(state).map_err(|e| {
-            eprintln!("storage: commit failed: {e}");
-            StorageError
-        })
-    }
-}
-
-pub struct Device {
+pub struct Device<S: Storage> {
     pub hsm: Hsm,
-    pub storage: FileStorage,
+    pub storage: S,
 }
 
 /// Accepts connections forever, one thread and one HSM session each.
-pub fn serve(listener: UnixListener, device: Device) {
+pub fn serve<S: Storage + Send + 'static>(listener: UnixListener, device: Device<S>) {
     serve_with(listener, device, true)
 }
 
 /// Like `serve`, but `log: false` turns off the per-command log line (used
 /// by the benchmarks, where writing to the terminal would skew timings).
-pub fn serve_with(listener: UnixListener, device: Device, log: bool) {
+pub fn serve_with<S: Storage + Send + 'static>(
+    listener: UnixListener,
+    device: Device<S>,
+    log: bool,
+) {
     let device = Arc::new(Mutex::new(device));
     for conn in listener.incoming() {
         match conn {
@@ -95,9 +52,9 @@ pub fn serve_with(listener: UnixListener, device: Device, log: bool) {
 }
 
 /// One connection = one HSM session. Frames are `[len: u32 LE][frame]`.
-fn handle_connection(
+fn handle_connection<S: Storage>(
     mut stream: UnixStream,
-    device: &Mutex<Device>,
+    device: &Mutex<Device<S>>,
     log_commands: bool,
 ) -> io::Result<()> {
     let mut session = Session::default();
