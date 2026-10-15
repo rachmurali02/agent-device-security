@@ -13,6 +13,9 @@ use crate::wire::{PUBLIC_KEY_LEN, Reader, SERIAL_LEN, SIGNATURE_LEN, WireError, 
 
 pub const MAX_TARGET: usize = 64;
 pub const MAX_DETAILS: usize = 128;
+/// A receiver's one-time code, when present, is 16-32 random bytes.
+pub const MIN_NONCE: usize = 16;
+pub const MAX_NONCE: usize = 32;
 pub const CHALLENGE_LEN: usize = 32;
 pub const DIGEST_LEN: usize = 32;
 
@@ -26,7 +29,7 @@ const POLICY_DOMAIN: &[u8; 12] = b"QHSM-POLICY\x01";
 /// Largest possible encoded statement.
 pub const MAX_STATEMENT: usize =
     STATEMENT_DOMAIN.len() + SERIAL_LEN + 4 + 8 + ACTION_MAX + 1 + DIGEST_LEN;
-const ACTION_MAX: usize = 1 + 8 + 2 + MAX_TARGET + 2 + MAX_DETAILS;
+const ACTION_MAX: usize = 1 + 8 + 2 + MAX_TARGET + 2 + MAX_DETAILS + 2 + MAX_NONCE + 8;
 const CONFIRM_MAX: usize = CONFIRM_DOMAIN.len() + SERIAL_LEN + CHALLENGE_LEN + 4 + ACTION_MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,12 +99,33 @@ pub const ALL_KINDS: u16 = {
 /// - `target` (1-64 bytes) and `details` (0-128 bytes) are printable ASCII,
 ///   so no control characters, invisible characters or look-alike letters.
 /// - `amount` (in cents) is non-zero for payments and zero for everything else.
+/// - `nonce` is empty or 16-32 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Action<'a> {
     pub kind: ActionKind,
     pub amount: u64,
     pub target: &'a [u8],
     pub details: &'a [u8],
+    /// One-time code chosen by whoever will receive the action (a shop's
+    /// payment request, a server's challenge). Signed into the statement so
+    /// the receiver can reject replays. Empty if the receiver gave none.
+    pub nonce: &'a [u8],
+    /// "Valid until", in Unix seconds, as set by the receiver; 0 means no
+    /// expiry. The HSM has no clock, so the *receiver* checks this against
+    /// its own clock. The HSM's job is to make it impossible to change.
+    pub expires: u64,
+}
+
+/// Strict check for a public key arriving from outside: it must be a point on
+/// the curve, in its one canonical encoding, and not a "weak" small-order
+/// point. (`VerifyingKey::from_bytes` alone accepts non-canonical encodings
+/// such as all-`0xff`, which a test caught.)
+pub fn valid_public_key(bytes: &[u8; PUBLIC_KEY_LEN]) -> bool {
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    match CompressedEdwardsY(*bytes).decompress() {
+        Some(point) => point.compress().to_bytes() == *bytes && !point.is_small_order(),
+        None => false,
+    }
 }
 
 fn printable(s: &[u8]) -> bool {
@@ -113,7 +137,13 @@ impl<'a> Action<'a> {
         let amount_ok = (self.kind == ActionKind::Payment) == (self.amount > 0);
         let target_ok = !self.target.is_empty() && self.target.len() <= MAX_TARGET;
         let details_ok = self.details.len() <= MAX_DETAILS;
-        if amount_ok && target_ok && details_ok && printable(self.target) && printable(self.details)
+        let nonce_ok = self.nonce.is_empty() || (MIN_NONCE..=MAX_NONCE).contains(&self.nonce.len());
+        if amount_ok
+            && target_ok
+            && details_ok
+            && nonce_ok
+            && printable(self.target)
+            && printable(self.details)
         {
             Ok(())
         } else {
@@ -127,6 +157,8 @@ impl<'a> Action<'a> {
             amount: r.u64()?,
             target: r.bytes(MAX_TARGET)?,
             details: r.bytes(MAX_DETAILS)?,
+            nonce: r.bytes(MAX_NONCE)?,
+            expires: r.u64()?,
         };
         action.validate()?;
         Ok(action)
@@ -137,15 +169,17 @@ impl<'a> Action<'a> {
         w.u8(self.kind as u8)?;
         w.u64(self.amount)?;
         w.bytes(self.target)?;
-        w.bytes(self.details)
+        w.bytes(self.details)?;
+        w.bytes(self.nonce)?;
+        w.u64(self.expires)
     }
 }
 
 /// The rules attached to an agent key when it is created.
 ///
-/// Milestone 2: a policy is fixed for the key's lifetime, so nobody, not
-/// even a logged-in user, can loosen it. Changing rules will need sign-off
-/// from several people (milestone 3).
+/// A policy is fixed for the key's lifetime. Creating a key with a policy
+/// needs sign-off from several admins, and the HSM certifies the pairing of
+/// key and policy in a birth certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Zeroize)]
 pub struct Policy {
     /// Kinds of action this key may approve (`ActionKind::bit` mask).
@@ -161,9 +195,11 @@ pub struct Policy {
     /// Public key of the user's confirmation device, if any. Without one,
     /// any action that needs confirmation is refused.
     pub confirmer: Option<[u8; PUBLIC_KEY_LEN]>,
+    /// Refuse any action that does not carry a receiver's one-time code.
+    pub require_nonce: bool,
 }
 
-pub const POLICY_LEN: usize = 2 + 8 + 8 + 8 + 2 + 1 + PUBLIC_KEY_LEN;
+pub const POLICY_LEN: usize = 2 + 8 + 8 + 8 + 2 + 1 + PUBLIC_KEY_LEN + 1;
 
 impl Policy {
     pub fn read(r: &mut Reader<'_>) -> Result<Self, WireError> {
@@ -179,6 +215,11 @@ impl Policy {
             1 => Some(key),
             _ => return Err(WireError::Invalid),
         };
+        let require_nonce = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(WireError::Invalid),
+        };
         let policy = Policy {
             allowed,
             max_amount,
@@ -186,6 +227,7 @@ impl Policy {
             confirm_above,
             always_confirm,
             confirmer,
+            require_nonce,
         };
         policy.validate()?;
         Ok(policy)
@@ -199,16 +241,15 @@ impl Policy {
         w.u64(self.confirm_above)?;
         w.u16(self.always_confirm)?;
         w.u8(self.confirmer.is_some() as u8)?;
-        w.raw(&self.confirmer.unwrap_or([0; PUBLIC_KEY_LEN]))
+        w.raw(&self.confirmer.unwrap_or([0; PUBLIC_KEY_LEN]))?;
+        w.u8(self.require_nonce as u8)
     }
 
     pub fn validate(&self) -> Result<(), WireError> {
         let kinds_ok = self.allowed != 0
             && self.allowed & !ALL_KINDS == 0
             && self.always_confirm & !ALL_KINDS == 0;
-        let confirmer_ok = self
-            .confirmer
-            .is_none_or(|k| VerifyingKey::from_bytes(&k).is_ok());
+        let confirmer_ok = self.confirmer.is_none_or(|k| valid_public_key(&k));
         if kinds_ok && confirmer_ok {
             Ok(())
         } else {

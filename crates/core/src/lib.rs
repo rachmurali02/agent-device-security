@@ -7,12 +7,14 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod agent;
+pub mod cert;
 pub mod hsm;
 pub mod keystore;
 pub mod wire;
 
-pub use hsm::{Hsm, Session, Storage, StorageError};
+pub use hsm::{Hsm, Provisioning, Session, Storage, StorageError};
 
 #[cfg(test)]
 mod tests;

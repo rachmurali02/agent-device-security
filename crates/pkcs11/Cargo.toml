@@ -16,5 +16,6 @@ quorum-client = { path = "../client" }
 quorum-core = { path = "../core" }
 
 [dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
 quorum-emulator = { path = "../emulator" }
 quorum-client = { path = "../client" }

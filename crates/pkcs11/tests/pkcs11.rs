@@ -10,11 +10,16 @@ use std::sync::Mutex;
 
 use cryptoki_sys::*;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use quorum_core::Hsm;
+use quorum_core::{Hsm, Provisioning};
 use quorum_emulator::{Device, FileStorage};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 const PIN: &[u8] = b"123456";
+const SERIAL_NO: &[u8; 16] = b"TEST000000000001";
+
+fn admin(i: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[40 + i; 32])
+}
 
 fn functions() -> &'static CK_FUNCTION_LIST {
     let mut list: *mut CK_FUNCTION_LIST = ptr::null_mut();
@@ -43,7 +48,20 @@ impl Token {
         let mut storage = FileStorage {
             path: dir.join("hsm.state"),
         };
-        let hsm = Hsm::provision(*b"TEST000000000001", PIN, &mut storage).unwrap();
+        let hsm = Hsm::provision(
+            Provisioning {
+                serial: *SERIAL_NO,
+                pin: PIN,
+                admins: &[
+                    admin(0).verifying_key().to_bytes(),
+                    admin(1).verifying_key().to_bytes(),
+                ],
+                threshold: 2,
+            },
+            &mut rand_core::OsRng,
+            &mut storage,
+        )
+        .unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
         std::thread::spawn(move || quorum_emulator::serve(listener, Device { hsm, storage }));
 
@@ -330,7 +348,9 @@ fn unsupported_functions_fail_cleanly() {
 }
 
 #[test]
-fn agent_keys_are_visible_but_cannot_sign_through_pkcs11() {
+fn agent_keys_are_visible_but_cannot_sign_or_be_deleted_through_pkcs11() {
+    use ed25519_dalek::Signer;
+    use quorum_core::admin::{AdminOp, Approvals, MAX_PROPOSAL, Proposal};
     use quorum_core::agent::{ActionKind, Policy};
     use quorum_core::wire::{Request, Status, resp};
 
@@ -345,18 +365,42 @@ fn agent_keys_are_visible_but_cannot_sign_through_pkcs11() {
         confirm_above: 100,
         always_confirm: 0,
         confirmer: None,
+        require_nonce: false,
     };
+    // Both admins sign off on creating it.
+    let (_, payload) = c.call(&Request::GetAdminChallenge).unwrap();
+    let challenge = resp::decode_challenge(&payload).unwrap();
+    let op = AdminOp::CreateAgentKey {
+        label: b"agent",
+        ext_id: b"",
+        policy,
+    };
+    let mut buf = [0u8; MAX_PROPOSAL];
+    let n = Proposal {
+        serial: *SERIAL_NO,
+        challenge,
+        op,
+    }
+    .encode(&mut buf)
+    .unwrap();
+    let mut approvals = Approvals::default();
+    for i in 0..2 {
+        approvals
+            .push(i, admin(i).sign(&buf[..n]).to_bytes())
+            .unwrap();
+    }
     let (status, payload) = c
         .call(&Request::GenerateAgentKey {
             label: b"agent",
             ext_id: b"",
             policy,
+            approvals,
         })
         .unwrap();
     assert_eq!(status, Status::Ok);
-    let key = resp::Generated::decode(&payload).unwrap().key;
+    let key = resp::AgentKeyCreated::decode(&payload).unwrap().key;
 
-    let s = t.open(false);
+    let s = t.open(true);
     assert_eq!(t.login(s, PIN), CKR_OK);
     let found = t.find(s, &mut [attr(CKA_LABEL, b"agent")]);
     assert_eq!(found.len(), 2);
@@ -367,5 +411,10 @@ fn agent_keys_are_visible_but_cannot_sign_through_pkcs11() {
     assert_eq!(
         t.sign(s, privh, b"forged"),
         Err(CKR_KEY_FUNCTION_NOT_PERMITTED)
+    );
+    // PKCS#11 can't delete it either: that needs admin sign-off.
+    assert_eq!(
+        unsafe { t.f.C_DestroyObject.unwrap()(s, privh) },
+        CKR_ACTION_PROHIBITED
     );
 }

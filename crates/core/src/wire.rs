@@ -19,6 +19,7 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 pub const SERIAL_LEN: usize = 16;
 
+use crate::admin::{AdminSet, Approvals};
 use crate::agent::{Action, Policy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,7 @@ pub enum Cmd {
     GetInfo = 0x01,
     Login = 0x02,
     Logout = 0x03,
+    GetIdentity = 0x04,
     GenerateKey = 0x10,
     ListKeys = 0x11,
     Sign = 0x12,
@@ -51,6 +53,9 @@ pub enum Cmd {
     GetChallenge = 0x20,
     SignAction = 0x21,
     GetKeyPolicy = 0x22,
+    GetKeyCert = 0x23,
+    GetAdminChallenge = 0x30,
+    DeleteAgentKey = 0x31,
 }
 
 impl TryFrom<u8> for Cmd {
@@ -60,6 +65,7 @@ impl TryFrom<u8> for Cmd {
             0x01 => Cmd::GetInfo,
             0x02 => Cmd::Login,
             0x03 => Cmd::Logout,
+            0x04 => Cmd::GetIdentity,
             0x10 => Cmd::GenerateKey,
             0x11 => Cmd::ListKeys,
             0x12 => Cmd::Sign,
@@ -68,6 +74,9 @@ impl TryFrom<u8> for Cmd {
             0x20 => Cmd::GetChallenge,
             0x21 => Cmd::SignAction,
             0x22 => Cmd::GetKeyPolicy,
+            0x23 => Cmd::GetKeyCert,
+            0x30 => Cmd::GetAdminChallenge,
+            0x31 => Cmd::DeleteAgentKey,
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -97,6 +106,15 @@ pub enum Status {
     ConfirmationRequired = 0x13,
     ConfirmationInvalid = 0x14,
     NoChallenge = 0x15,
+    /// The key's rules require a receiver's one-time code and none was given.
+    NonceRequired = 0x16,
+    // Multi-person sign-off.
+    /// This operation needs admin sign-off (or no admins were set up).
+    QuorumRequired = 0x20,
+    /// An admin signature is wrong, unknown, or repeated.
+    ApprovalInvalid = 0x21,
+    /// No pending admin challenge (never requested, or already used).
+    NoAdminChallenge = 0x22,
 }
 
 impl TryFrom<u8> for Status {
@@ -120,6 +138,10 @@ impl TryFrom<u8> for Status {
             0x13 => Status::ConfirmationRequired,
             0x14 => Status::ConfirmationInvalid,
             0x15 => Status::NoChallenge,
+            0x16 => Status::NonceRequired,
+            0x20 => Status::QuorumRequired,
+            0x21 => Status::ApprovalInvalid,
+            0x22 => Status::NoAdminChallenge,
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -257,11 +279,26 @@ pub enum Request<'a> {
     DeleteKey {
         key: u32,
     },
+    /// Who this HSM is: serial, identity public key, admins.
+    GetIdentity,
     /// Create a key that can only sign agent actions allowed by `policy`.
+    /// Needs admin sign-off on the matching proposal.
     GenerateAgentKey {
         label: &'a [u8],
         ext_id: &'a [u8],
         policy: Policy,
+        approvals: Approvals,
+    },
+    /// Delete an agent key. Needs admin sign-off.
+    DeleteAgentKey {
+        key: u32,
+        approvals: Approvals,
+    },
+    /// Get a one-time challenge for an admin proposal.
+    GetAdminChallenge,
+    /// Get an agent key's birth certificate.
+    GetKeyCert {
+        key: u32,
     },
     /// Get a fresh one-time challenge for a user confirmation.
     GetChallenge,
@@ -296,11 +333,19 @@ impl<'a> Request<'a> {
                 msg: r.bytes(MAX_MESSAGE)?,
             },
             Cmd::DeleteKey => Request::DeleteKey { key: r.u32()? },
+            Cmd::GetIdentity => Request::GetIdentity,
             Cmd::GenerateAgentKey => Request::GenerateAgentKey {
                 label: r.bytes(MAX_LABEL)?,
                 ext_id: r.bytes(MAX_EXT_ID)?,
                 policy: Policy::read(&mut r)?,
+                approvals: Approvals::read(&mut r)?,
             },
+            Cmd::DeleteAgentKey => Request::DeleteAgentKey {
+                key: r.u32()?,
+                approvals: Approvals::read(&mut r)?,
+            },
+            Cmd::GetAdminChallenge => Request::GetAdminChallenge,
+            Cmd::GetKeyCert => Request::GetKeyCert { key: r.u32()? },
             Cmd::GetChallenge => Request::GetChallenge,
             Cmd::SignAction => Request::SignAction {
                 key: r.u32()?,
@@ -341,15 +386,28 @@ impl<'a> Request<'a> {
                 w.u8(Cmd::DeleteKey as u8)?;
                 w.u32(key)?;
             }
+            Request::GetIdentity => w.u8(Cmd::GetIdentity as u8)?,
             Request::GenerateAgentKey {
                 label,
                 ext_id,
                 policy,
+                approvals,
             } => {
                 w.u8(Cmd::GenerateAgentKey as u8)?;
                 w.bytes(label)?;
                 w.bytes(ext_id)?;
                 policy.write(&mut w)?;
+                approvals.write(&mut w)?;
+            }
+            Request::DeleteAgentKey { key, approvals } => {
+                w.u8(Cmd::DeleteAgentKey as u8)?;
+                w.u32(key)?;
+                approvals.write(&mut w)?;
+            }
+            Request::GetAdminChallenge => w.u8(Cmd::GetAdminChallenge as u8)?,
+            Request::GetKeyCert { key } => {
+                w.u8(Cmd::GetKeyCert as u8)?;
+                w.u32(key)?;
             }
             Request::GetChallenge => w.u8(Cmd::GetChallenge as u8)?,
             Request::SignAction {
@@ -558,6 +616,81 @@ pub mod resp {
         let c = r.array()?;
         r.finish()?;
         Ok(c)
+    }
+
+    /// `GetIdentity` payload.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Identity {
+        pub serial: [u8; SERIAL_LEN],
+        /// Signs birth certificates only.
+        pub public: [u8; PUBLIC_KEY_LEN],
+        pub admins: AdminSet,
+    }
+
+    impl Identity {
+        pub fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
+            w.raw(&self.serial)?;
+            w.raw(&self.public)?;
+            self.admins.write(w)
+        }
+
+        pub fn decode(payload: &[u8]) -> Result<Self, WireError> {
+            let mut r = Reader::new(payload);
+            let id = Identity {
+                serial: r.array()?,
+                public: r.array()?,
+                admins: AdminSet::read(&mut r)?,
+            };
+            r.finish()?;
+            Ok(id)
+        }
+    }
+
+    /// A birth certificate and the HSM identity's signature on it.
+    pub fn write_cert(
+        w: &mut Writer<'_>,
+        cert: &[u8],
+        sig: &[u8; SIGNATURE_LEN],
+    ) -> Result<(), WireError> {
+        w.bytes(cert)?;
+        w.raw(sig)
+    }
+
+    fn read_cert<'a>(r: &mut Reader<'a>) -> Result<(&'a [u8], [u8; SIGNATURE_LEN]), WireError> {
+        Ok((r.bytes(crate::cert::KEYCERT_LEN)?, r.array()?))
+    }
+
+    /// `GetKeyCert` payload.
+    pub fn decode_cert(payload: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireError> {
+        let mut r = Reader::new(payload);
+        let c = read_cert(&mut r)?;
+        r.finish()?;
+        Ok(c)
+    }
+
+    /// `GenerateAgentKey` payload: the new key and its birth certificate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AgentKeyCreated<'a> {
+        pub key: u32,
+        pub public: [u8; PUBLIC_KEY_LEN],
+        pub cert: &'a [u8],
+        pub cert_sig: [u8; SIGNATURE_LEN],
+    }
+
+    impl<'a> AgentKeyCreated<'a> {
+        pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
+            let mut r = Reader::new(payload);
+            let key = r.u32()?;
+            let public = r.array()?;
+            let (cert, cert_sig) = read_cert(&mut r)?;
+            r.finish()?;
+            Ok(AgentKeyCreated {
+                key,
+                public,
+                cert,
+                cert_sig,
+            })
+        }
     }
 }
 

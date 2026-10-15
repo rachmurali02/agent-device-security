@@ -9,26 +9,41 @@ use rand_core::CryptoRngCore;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use ed25519_dalek::{Signer, SigningKey};
+
+use crate::admin::{AdminOp, AdminSet, Approvals, MAX_ADMINS, MAX_PROPOSAL, Proposal, QuorumError};
 use crate::agent::{
     Action, CHALLENGE_LEN, MAX_STATEMENT, POLICY_LEN, Policy, Statement, confirmation_valid,
 };
+use crate::cert::{KEYCERT_LEN, KeyCert};
 use crate::keystore::{KeyMeta, KeyStore, MAX_KEYS, SECRET_LEN, UseError};
 use crate::wire::{
     KeyUsage, MAX_EXT_ID, MAX_LABEL, MAX_PIN, MIN_PIN, Reader, Request, SERIAL_LEN, SIGNATURE_LEN,
     Status, WireError, Writer, resp,
 };
 
-pub const FW_VERSION: (u8, u8) = (0, 2);
+pub const FW_VERSION: (u8, u8) = (0, 3);
 pub const MAX_PIN_TRIES: u8 = 5;
 
 const STATE_MAGIC: &[u8; 4] = b"QHSM";
-const STATE_VERSION: u8 = 2;
+const STATE_VERSION: u8 = 3;
 /// Worst case per key: an agent key, which also stores its policy and counters.
 const SLOT_STATE_LEN: usize =
-    4 + 1 + MAX_LABEL + 1 + MAX_EXT_ID + SECRET_LEN + 1 + POLICY_LEN + 8 + 8;
+    4 + 1 + MAX_LABEL + 1 + MAX_EXT_ID + SECRET_LEN + 1 + POLICY_LEN + 8 + 8 + 1;
+const IDENTITY_SECRET_LEN: usize = 32;
+const ADMINS_STATE_LEN: usize = 2 + MAX_ADMINS * 32;
 /// Upper bound on the serialized state size.
-pub const STATE_MAX: usize =
-    4 + 1 + SERIAL_LEN + 1 + MAX_PIN + 1 + 4 + 1 + MAX_KEYS * SLOT_STATE_LEN;
+pub const STATE_MAX: usize = 4
+    + 1
+    + SERIAL_LEN
+    + 1
+    + MAX_PIN
+    + 1
+    + IDENTITY_SECRET_LEN
+    + ADMINS_STATE_LEN
+    + 4
+    + 1
+    + MAX_KEYS * SLOT_STATE_LEN;
 
 /// Persistent storage for HSM state (flash on a device, a file in the emulator).
 ///
@@ -52,7 +67,20 @@ pub enum StateError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitError {
     BadPinLength,
+    /// Duplicate or invalid admin keys, or an impossible threshold.
+    BadAdmins,
     Storage,
+}
+
+/// Everything the factory decides when it creates an HSM.
+pub struct Provisioning<'a> {
+    pub serial: [u8; SERIAL_LEN],
+    pub pin: &'a [u8],
+    /// Admins whose sign-off is needed to create or delete agent keys.
+    /// Empty means agent keys can never be created on this HSM.
+    pub admins: &'a [[u8; 32]],
+    /// How many admins must sign off.
+    pub threshold: u8,
 }
 
 /// Per-connection state. On real hardware this lives in the HSM's RAM, keyed
@@ -78,6 +106,15 @@ pub struct Hsm {
     pin_len: u8,
     pin_tries_left: u8,
     store: KeyStore,
+    /// Signs birth certificates and nothing else. Created at the factory,
+    /// never leaves the HSM.
+    identity: [u8; IDENTITY_SECRET_LEN],
+    #[zeroize(skip)]
+    admins: AdminSet,
+    /// One-time challenge for the pending admin proposal. Kept in RAM only:
+    /// a restart cancels any proposal in progress.
+    #[zeroize(skip)]
+    admin_challenge: Option<[u8; CHALLENGE_LEN]>,
     /// Set when storage fails. A faulted HSM refuses every command (fail
     /// closed) until it restarts and reloads its last committed state.
     #[zeroize(skip)]
@@ -87,28 +124,40 @@ pub struct Hsm {
 impl Hsm {
     /// Factory provisioning: create a fresh HSM and commit its first state.
     pub fn provision(
-        serial: [u8; SERIAL_LEN],
-        pin: &[u8],
+        p: Provisioning<'_>,
+        rng: &mut impl CryptoRngCore,
         storage: &mut impl Storage,
     ) -> Result<Self, InitError> {
-        if !(MIN_PIN..=MAX_PIN).contains(&pin.len()) {
+        if !(MIN_PIN..=MAX_PIN).contains(&p.pin.len()) {
             return Err(InitError::BadPinLength);
         }
+        let admins = AdminSet::new(p.admins, p.threshold).map_err(|_| InitError::BadAdmins)?;
         let mut hsm = Hsm {
-            serial,
+            serial: p.serial,
             pin: [0; MAX_PIN],
-            pin_len: pin.len() as u8,
+            pin_len: p.pin.len() as u8,
             pin_tries_left: MAX_PIN_TRIES,
             store: KeyStore::new(),
+            identity: [0; IDENTITY_SECRET_LEN],
+            admins,
+            admin_challenge: None,
             faulted: false,
         };
-        hsm.pin[..pin.len()].copy_from_slice(pin);
+        rng.fill_bytes(&mut hsm.identity);
+        hsm.pin[..p.pin.len()].copy_from_slice(p.pin);
         hsm.commit(storage).map_err(|_| InitError::Storage)?;
         Ok(hsm)
     }
 
     pub fn serial(&self) -> &[u8; SERIAL_LEN] {
         &self.serial
+    }
+
+    /// The public half of the identity key: what receivers trust.
+    pub fn identity_public(&self) -> [u8; 32] {
+        SigningKey::from_bytes(&self.identity)
+            .verifying_key()
+            .to_bytes()
     }
 
     pub fn is_faulted(&self) -> bool {
@@ -221,25 +270,73 @@ impl Hsm {
 
             Request::DeleteKey { key } => {
                 require_login(session)?;
-                if !self.store.delete(key) {
-                    return Err(Status::KeyNotFound);
+                let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
+                // Deleting an agent key needs admin sign-off; otherwise the
+                // PIN holder could delete it and ask for a fresh budget.
+                if slot.usage == KeyUsage::Agent {
+                    return Err(Status::QuorumRequired);
                 }
+                self.store.delete(key);
                 self.commit(storage)
+            }
+
+            Request::GetIdentity => resp::Identity {
+                serial: self.serial,
+                public: self.identity_public(),
+                admins: self.admins,
+            }
+            .encode(w)
+            .map_err(overflow),
+
+            Request::GetAdminChallenge => {
+                require_login(session)?;
+                let mut challenge = [0u8; CHALLENGE_LEN];
+                rng.fill_bytes(&mut challenge);
+                self.admin_challenge = Some(challenge);
+                w.raw(&challenge).map_err(overflow)
             }
 
             Request::GenerateAgentKey {
                 label,
                 ext_id,
                 policy,
+                approvals,
             } => {
                 require_login(session)?;
+                let op = AdminOp::CreateAgentKey {
+                    label,
+                    ext_id,
+                    policy,
+                };
+                let approvers = self.check_quorum(&op, &approvals)?;
                 let (id, public) = self
                     .store
-                    .generate(rng, KeyMeta::agent(label, ext_id, policy))
+                    .generate(rng, KeyMeta::agent(label, ext_id, policy, approvers))
                     .map_err(|_| Status::StoreFull)?;
                 self.commit(storage)?;
                 w.u32(id).map_err(overflow)?;
-                w.raw(&public).map_err(overflow)
+                w.raw(&public).map_err(overflow)?;
+                self.write_cert(id, w)
+            }
+
+            Request::DeleteAgentKey { key, approvals } => {
+                require_login(session)?;
+                let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
+                if slot.usage != KeyUsage::Agent {
+                    return Err(Status::UsageNotAllowed);
+                }
+                self.check_quorum(&AdminOp::DeleteAgentKey { key }, &approvals)?;
+                self.store.delete(key);
+                self.commit(storage)
+            }
+
+            // Certificates are public: they are meant to be handed out.
+            Request::GetKeyCert { key } => {
+                let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
+                if slot.usage != KeyUsage::Agent {
+                    return Err(Status::UsageNotAllowed);
+                }
+                self.write_cert(key, w)
             }
 
             Request::GetChallenge => {
@@ -295,6 +392,10 @@ impl Hsm {
         // 1. Is this kind of action allowed at all?
         if !policy.allows(action.kind) {
             return Err(Status::ActionNotAllowed);
+        }
+        // 1b. Do the rules demand a receiver's one-time code?
+        if policy.require_nonce && action.nonce.is_empty() {
+            return Err(Status::NonceRequired);
         }
         // 2. Is this single payment small enough?
         if action.amount > policy.max_amount {
@@ -352,6 +453,53 @@ impl Hsm {
         let overflow = |_: WireError| Status::ResponseTooLarge;
         w.bytes(&buf[..len]).map_err(overflow)?;
         w.raw(&sig).map_err(overflow)
+    }
+
+    /// Uses up the pending admin challenge and checks the approvals against
+    /// the proposal rebuilt from this HSM's serial, that challenge and `op`.
+    /// Returns which admins approved.
+    fn check_quorum(&mut self, op: &AdminOp<'_>, approvals: &Approvals) -> Result<u8, Status> {
+        if self.admins.keys().is_empty() {
+            return Err(Status::QuorumRequired);
+        }
+        let challenge = self
+            .admin_challenge
+            .take()
+            .ok_or(Status::NoAdminChallenge)?;
+        let mut buf = [0u8; MAX_PROPOSAL];
+        let len = Proposal {
+            serial: self.serial,
+            challenge,
+            op: *op,
+        }
+        .encode(&mut buf)
+        .map_err(|_| Status::BadRequest)?;
+        self.admins
+            .check(&buf[..len], approvals)
+            .map_err(|e| match e {
+                QuorumError::NoAdmins | QuorumError::NotEnough => Status::QuorumRequired,
+                QuorumError::Invalid => Status::ApprovalInvalid,
+            })
+    }
+
+    /// Writes an agent key's birth certificate and the identity signature.
+    /// Ed25519 signatures are deterministic, so this always produces the
+    /// same certificate for the same key.
+    fn write_cert(&self, key: u32, w: &mut Writer<'_>) -> Result<(), Status> {
+        let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
+        let cert = KeyCert {
+            serial: self.serial,
+            key,
+            public: slot.public,
+            policy: slot.policy,
+            approvers: slot.approvers,
+        };
+        let mut buf = [0u8; KEYCERT_LEN];
+        let len = cert.encode(&mut buf).map_err(|_| Status::Fault)?;
+        let sig = SigningKey::from_bytes(&self.identity)
+            .sign(&buf[..len])
+            .to_bytes();
+        resp::write_cert(w, &buf[..len], &sig).map_err(|_| Status::ResponseTooLarge)
     }
 
     fn login(
@@ -425,6 +573,8 @@ impl Hsm {
         w.u8(self.pin_len)?;
         w.raw(&self.pin)?;
         w.u8(self.pin_tries_left)?;
+        w.raw(&self.identity)?;
+        self.admins.write(&mut w)?;
         w.u32(self.store.next_id())?;
         w.u8(self.store.len() as u8)?;
         for slot in self.store.slots() {
@@ -439,6 +589,7 @@ impl Hsm {
                 slot.policy.write(&mut w)?;
                 w.u64(slot.spent)?;
                 w.u64(slot.approved)?;
+                w.u8(slot.approvers)?;
             }
         }
         Ok(w.len())
@@ -461,6 +612,9 @@ impl Hsm {
             pin: r.array().map_err(bad)?,
             pin_tries_left: r.u8().map_err(bad)?,
             store: KeyStore::new(),
+            identity: r.array().map_err(bad)?,
+            admins: AdminSet::read(&mut r).map_err(bad)?,
+            admin_challenge: None,
             faulted: false,
         };
         let pin_len = hsm.pin_len as usize;
@@ -521,13 +675,14 @@ fn read_key_meta<'a>(
             let policy = Policy::read(r).map_err(bad)?;
             let spent = r.u64().map_err(bad)?;
             let approved = r.u64().map_err(bad)?;
+            let approvers = r.u8().map_err(bad)?;
             if spent > policy.budget {
                 return Err(StateError::Malformed);
             }
             Ok(KeyMeta {
                 spent,
                 approved,
-                ..KeyMeta::agent(label, ext_id, policy)
+                ..KeyMeta::agent(label, ext_id, policy, approvers)
             })
         }
     }

@@ -51,6 +51,15 @@ impl Storage for MemStorage {
 
 const PIN: &[u8] = b"123456";
 
+/// Three admins (Alice, Bob, Carol). The default test HSM needs any two.
+fn admins() -> [ed25519_dalek::SigningKey; 3] {
+    [21, 22, 23].map(|b| ed25519_dalek::SigningKey::from_bytes(&[b; 32]))
+}
+
+fn admin_publics() -> [[u8; 32]; 3] {
+    admins().map(|k| k.verifying_key().to_bytes())
+}
+
 struct Fixture {
     hsm: Hsm,
     session: Session,
@@ -60,13 +69,29 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_admins(&admin_publics(), 2)
+    }
+
+    /// A fresh HSM whose agent-key operations need `threshold` of `admins`.
+    fn with_admins(admins: &[[u8; 32]], threshold: u8) -> Self {
         let mut storage = MemStorage::default();
-        let hsm = Hsm::provision(*b"TESTSERIAL000001", PIN, &mut storage).unwrap();
+        let mut rng = TestRng(7);
+        let hsm = Hsm::provision(
+            crate::Provisioning {
+                serial: *b"TESTSERIAL000001",
+                pin: PIN,
+                admins,
+                threshold,
+            },
+            &mut rng,
+            &mut storage,
+        )
+        .unwrap();
         Fixture {
             hsm,
             session: Session::default(),
             storage,
-            rng: TestRng(7),
+            rng,
         }
     }
 
@@ -373,11 +398,35 @@ fn storage_failure_on_generate_faults_and_reload_has_no_ghost_key() {
 
 mod agent {
     use super::*;
+    use crate::admin::{AdminOp, Approvals, MAX_PROPOSAL, Proposal};
     use crate::agent::{
         Action, ActionKind, CONFIRM_MESSAGE_MAX, Policy, Statement, VerifyError,
         confirmation_message, verify_statement,
     };
     use ed25519_dalek::{Signer, SigningKey};
+
+    /// What each admin's tool does: sign the exact proposal.
+    pub(super) fn sign_proposal(
+        challenge: &[u8; 32],
+        op: &AdminOp<'_>,
+        who: &[usize],
+    ) -> Approvals {
+        let mut buf = [0u8; MAX_PROPOSAL];
+        let n = Proposal {
+            serial: SERIAL,
+            challenge: *challenge,
+            op: *op,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        let mut approvals = Approvals::default();
+        for &i in who {
+            approvals
+                .push(i as u8, admins()[i].sign(&buf[..n]).to_bytes())
+                .unwrap();
+        }
+        approvals
+    }
 
     const SERIAL: [u8; 16] = *b"TESTSERIAL000001";
 
@@ -398,6 +447,7 @@ mod agent {
             confirm_above: 2_000,
             always_confirm: ActionKind::InstallSoftware.bit(),
             confirmer: Some(confirmer().verifying_key().to_bytes()),
+            require_nonce: false,
         }
     }
 
@@ -407,18 +457,49 @@ mod agent {
             amount: cents,
             target: to,
             details: b"",
+            nonce: b"",
+            expires: 0,
         }
     }
 
     impl Fixture {
-        fn agent_key(&mut self, policy: Policy) -> resp::Generated {
+        /// Creates an agent key with sign-off from Alice and Bob.
+        pub(super) fn agent_key(&mut self, policy: Policy) -> resp::Generated {
+            let (key, public, _, _) = self.agent_key_with_cert(policy);
+            resp::Generated { key, public }
+        }
+
+        pub(super) fn agent_key_with_cert(
+            &mut self,
+            policy: Policy,
+        ) -> (u32, [u8; 32], Vec<u8>, [u8; 64]) {
+            let op = AdminOp::CreateAgentKey {
+                label: b"agent",
+                ext_id: b"",
+                policy,
+            };
+            let approvals = self.approve(&op, &[0, 1]);
             let (status, payload) = self.call(Request::GenerateAgentKey {
                 label: b"agent",
                 ext_id: b"",
                 policy,
+                approvals,
             });
             assert_eq!(status, Status::Ok);
-            resp::Generated::decode(&payload).unwrap()
+            let c = resp::AgentKeyCreated::decode(&payload).unwrap();
+            (c.key, c.public, c.cert.to_vec(), c.cert_sig)
+        }
+
+        /// Gets an admin challenge and has the admins at `who` sign the proposal.
+        fn approve(&mut self, op: &AdminOp<'_>, who: &[usize]) -> Approvals {
+            let challenge = self.admin_challenge();
+            sign_proposal(&challenge, op, who)
+        }
+
+        pub(super) fn admin_challenge(&mut self) -> [u8; 32] {
+            let (status, payload) = self.call(Request::GetAdminChallenge);
+            assert_eq!(status, Status::Ok);
+            resp::decode_challenge(&payload).unwrap()
         }
 
         fn act(
@@ -507,6 +588,8 @@ mod agent {
             amount: 0,
             target: b"photos",
             details: b"",
+            nonce: b"",
+            expires: 0,
         };
         assert_eq!(f.act(k.key, delete, None), Err(Status::ActionNotAllowed));
     }
@@ -618,6 +701,8 @@ mod agent {
             amount: 0,
             target: b"com.example.app",
             details: b"v2.1",
+            nonce: b"",
+            expires: 0,
         };
         assert_eq!(
             f.act(k.key, install, None),
@@ -712,6 +797,8 @@ mod agent {
                 amount: 5,
                 target: b"bob",
                 details: b"",
+                nonce: b"",
+                expires: 0,
             }, // amount on a non-payment
         ];
         for a in bad_actions {
@@ -724,6 +811,8 @@ mod agent {
             w.u64(a.amount).unwrap();
             w.bytes(a.target).unwrap();
             w.bytes(a.details).unwrap();
+            w.bytes(a.nonce).unwrap();
+            w.u64(a.expires).unwrap();
             w.u8(0).unwrap();
             let n = w.len();
             assert_eq!(f.raw(&buf[..n]), vec![Status::BadRequest as u8], "{a:?}");
@@ -755,10 +844,12 @@ mod agent {
                 label: b"a",
                 ext_id: b"",
                 policy: shopping_policy(),
+                approvals: Approvals::default(),
             }
             .encode(&mut buf)
             .unwrap();
-            let off = n - crate::agent::POLICY_LEN;
+            // Policy sits just before the (empty, 1-byte) approvals list.
+            let off = n - 1 - crate::agent::POLICY_LEN;
             buf[off..off + 2].copy_from_slice(&policy.allowed.to_le_bytes());
             let ac = off + 2 + 8 + 8 + 8;
             buf[ac..ac + 2].copy_from_slice(&policy.always_confirm.to_le_bytes());
@@ -819,5 +910,465 @@ mod agent {
         let n = w.len();
         assert_eq!(Statement::decode(&buf[..n]).unwrap(), s);
         assert!(Statement::decode(&buf[..n - 1]).is_err());
+    }
+}
+
+// ---- multi-person sign-off and birth certificates ----------------------------
+
+mod quorum {
+    use super::agent::sign_proposal;
+    use super::*;
+    use crate::admin::{AdminOp, Approvals, MAX_PROPOSAL, Proposal};
+    use crate::agent::{Action, ActionKind, Policy};
+    use crate::cert::{ActionError, CertError, KeyCert, verify_action, verify_key_cert};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn policy() -> Policy {
+        Policy {
+            allowed: ActionKind::Payment.bit(),
+            max_amount: 5_000,
+            budget: 10_000,
+            confirm_above: 5_000,
+            always_confirm: 0,
+            confirmer: None,
+            require_nonce: false,
+        }
+    }
+
+    fn create<'a>(policy: Policy) -> AdminOp<'a> {
+        AdminOp::CreateAgentKey {
+            label: b"agent",
+            ext_id: b"",
+            policy,
+        }
+    }
+
+    fn submit(f: &mut Fixture, policy: Policy, approvals: Approvals) -> Status {
+        f.call(Request::GenerateAgentKey {
+            label: b"agent",
+            ext_id: b"",
+            policy,
+            approvals,
+        })
+        .0
+    }
+
+    fn identity(f: &mut Fixture) -> resp::Identity {
+        let (status, payload) = f.call(Request::GetIdentity);
+        assert_eq!(status, Status::Ok);
+        resp::Identity::decode(&payload).unwrap()
+    }
+
+    #[test]
+    fn the_pin_alone_cannot_create_an_agent_key() {
+        let mut f = Fixture::new();
+        f.login();
+        assert_eq!(
+            submit(&mut f, policy(), Approvals::default()),
+            Status::NoAdminChallenge
+        );
+        f.admin_challenge();
+        assert_eq!(
+            submit(&mut f, policy(), Approvals::default()),
+            Status::QuorumRequired
+        );
+    }
+
+    #[test]
+    fn one_of_two_required_admins_is_not_enough() {
+        let mut f = Fixture::new();
+        f.login();
+        let approvals = f_approve(&mut f, &create(policy()), &[2]);
+        assert_eq!(submit(&mut f, policy(), approvals), Status::QuorumRequired);
+    }
+
+    #[test]
+    fn two_admins_create_a_key_and_the_certificate_says_who() {
+        let mut f = Fixture::new();
+        f.login();
+        let approvals = f_approve(&mut f, &create(policy()), &[0, 2]);
+        let (status, payload) = f.call(Request::GenerateAgentKey {
+            label: b"agent",
+            ext_id: b"",
+            policy: policy(),
+            approvals,
+        });
+        assert_eq!(status, Status::Ok);
+        let created = resp::AgentKeyCreated::decode(&payload).unwrap();
+
+        let id = identity(&mut f);
+        assert_eq!(id.public, f.hsm.identity_public());
+        assert_eq!(id.admins.keys(), &admin_publics());
+        assert_eq!(id.admins.threshold(), 2);
+
+        let cert = verify_key_cert(&id.public, created.cert, &created.cert_sig).unwrap();
+        assert_eq!(
+            cert,
+            KeyCert {
+                serial: *b"TESTSERIAL000001",
+                key: created.key,
+                public: created.public,
+                policy: policy(),
+                approvers: 0b101, // Alice and Carol
+            }
+        );
+    }
+
+    #[test]
+    fn the_same_admin_twice_does_not_count_double() {
+        let mut f = Fixture::new();
+        f.login();
+        let approvals = f_approve(&mut f, &create(policy()), &[1, 1]);
+        assert_eq!(submit(&mut f, policy(), approvals), Status::ApprovalInvalid);
+    }
+
+    #[test]
+    fn outsiders_and_unknown_admin_numbers_are_rejected() {
+        let mut f = Fixture::new();
+        f.login();
+        let challenge = f.admin_challenge();
+        let mut approvals = sign_proposal(&challenge, &create(policy()), &[0]);
+        // Mallory signs and claims to be admin #1.
+        let mallory = SigningKey::from_bytes(&[66; 32]);
+        approvals
+            .push(
+                1,
+                mallory
+                    .sign(&proposal(&challenge, &create(policy())))
+                    .to_bytes(),
+            )
+            .unwrap();
+        assert_eq!(submit(&mut f, policy(), approvals), Status::ApprovalInvalid);
+
+        let challenge = f.admin_challenge();
+        let mut approvals = sign_proposal(&challenge, &create(policy()), &[0, 1]);
+        approvals.push(7, [0; 64]).unwrap(); // there is no admin #7
+        assert_eq!(submit(&mut f, policy(), approvals), Status::ApprovalInvalid);
+    }
+
+    fn proposal(challenge: &[u8; 32], op: &AdminOp<'_>) -> Vec<u8> {
+        let mut buf = [0u8; MAX_PROPOSAL];
+        let n = Proposal {
+            serial: *b"TESTSERIAL000001",
+            challenge: *challenge,
+            op: *op,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        buf[..n].to_vec()
+    }
+
+    fn f_approve(f: &mut Fixture, op: &AdminOp<'_>, who: &[usize]) -> Approvals {
+        let challenge = f.admin_challenge();
+        sign_proposal(&challenge, op, who)
+    }
+
+    #[test]
+    fn approvals_cover_the_exact_rules() {
+        let mut f = Fixture::new();
+        f.login();
+        // Admins approve a $100 budget; the operator submits $1,000,000.
+        let approvals = f_approve(&mut f, &create(policy()), &[0, 1]);
+        let greedy = Policy {
+            budget: 100_000_000,
+            ..policy()
+        };
+        assert_eq!(submit(&mut f, greedy, approvals), Status::ApprovalInvalid);
+    }
+
+    #[test]
+    fn approvals_are_single_use() {
+        let mut f = Fixture::new();
+        f.login();
+        let approvals = f_approve(&mut f, &create(policy()), &[0, 1]);
+        assert_eq!(submit(&mut f, policy(), approvals), Status::Ok);
+        // Replaying the same signatures to mint a second key fails...
+        assert_eq!(
+            submit(&mut f, policy(), approvals),
+            Status::NoAdminChallenge
+        );
+        // ...even after a fresh challenge, since they covered the old one.
+        f.admin_challenge();
+        assert_eq!(submit(&mut f, policy(), approvals), Status::ApprovalInvalid);
+    }
+
+    #[test]
+    fn approvals_from_another_hsm_do_not_work_here() {
+        let mut f = Fixture::new();
+        f.login();
+        let challenge = f.admin_challenge();
+        let mut buf = [0u8; MAX_PROPOSAL];
+        let n = Proposal {
+            serial: *b"OTHERHSM00000002",
+            challenge,
+            op: create(policy()),
+        }
+        .encode(&mut buf)
+        .unwrap();
+        let mut approvals = Approvals::default();
+        for i in [0, 1] {
+            approvals
+                .push(i as u8, admins()[i].sign(&buf[..n]).to_bytes())
+                .unwrap();
+        }
+        assert_eq!(submit(&mut f, policy(), approvals), Status::ApprovalInvalid);
+    }
+
+    #[test]
+    fn deleting_an_agent_key_needs_sign_off_too() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy());
+        // With just the PIN: refused, so a fresh budget can't be had by
+        // deleting and re-creating.
+        assert_eq!(
+            f.call(Request::DeleteKey { key: k.key }).0,
+            Status::QuorumRequired
+        );
+        let approvals = f_approve(&mut f, &AdminOp::DeleteAgentKey { key: k.key }, &[1, 2]);
+        assert_eq!(
+            f.call(Request::DeleteAgentKey {
+                key: k.key,
+                approvals
+            })
+            .0,
+            Status::Ok
+        );
+        assert_eq!(
+            f.call(Request::GetKeyCert { key: k.key }).0,
+            Status::KeyNotFound
+        );
+    }
+
+    #[test]
+    fn delete_approvals_name_the_key() {
+        let mut f = Fixture::new();
+        f.login();
+        let a = f.agent_key(policy()).key;
+        let b = f.agent_key(policy()).key;
+        let approvals = f_approve(&mut f, &AdminOp::DeleteAgentKey { key: a }, &[0, 1]);
+        assert_eq!(
+            f.call(Request::DeleteAgentKey { key: b, approvals }).0,
+            Status::ApprovalInvalid
+        );
+    }
+
+    #[test]
+    fn a_restart_cancels_a_pending_proposal() {
+        let mut f = Fixture::new();
+        f.login();
+        let approvals = f_approve(&mut f, &create(policy()), &[0, 1]);
+        f.hsm = Hsm::load(&f.storage.state).unwrap();
+        f.session = Session::default();
+        f.login();
+        assert_eq!(
+            submit(&mut f, policy(), approvals),
+            Status::NoAdminChallenge
+        );
+    }
+
+    #[test]
+    fn without_admins_agent_keys_cannot_exist() {
+        let mut f = Fixture::with_admins(&[], 0);
+        f.login();
+        f.admin_challenge();
+        assert_eq!(
+            submit(&mut f, policy(), Approvals::default()),
+            Status::QuorumRequired
+        );
+    }
+
+    #[test]
+    fn bad_admin_setups_are_refused_at_the_factory() {
+        let a = admin_publics();
+        let mut storage = MemStorage::default();
+        for (admins, threshold) in [
+            (&a[..], 0u8),          // nobody needs to approve
+            (&a[..], 4),            // more approvals than admins
+            (&[a[0], a[0]][..], 1), // the same admin twice
+            (&[][..], 1),           // a threshold with no admins
+            (&[[0xff; 32]][..], 1), // not a valid public key
+        ] {
+            let p = crate::Provisioning {
+                serial: [0; 16],
+                pin: PIN,
+                admins,
+                threshold,
+            };
+            assert!(
+                Hsm::provision(p, &mut TestRng(1), &mut storage).is_err(),
+                "accepted admins={admins:?} threshold={threshold}"
+            );
+        }
+    }
+
+    #[test]
+    fn certificates_are_reissued_identically_and_survive_restarts() {
+        let mut f = Fixture::new();
+        f.login();
+        let (key, _, cert, sig) = f.agent_key_with_cert(policy());
+        let (status, payload) = f.call(Request::GetKeyCert { key });
+        assert_eq!(status, Status::Ok);
+        assert_eq!(resp::decode_cert(&payload).unwrap(), (&cert[..], sig));
+
+        let identity_before = f.hsm.identity_public();
+        f.hsm = Hsm::load(&f.storage.state).unwrap();
+        assert_eq!(f.hsm.identity_public(), identity_before);
+        let (_, payload) = f.call(Request::GetKeyCert { key });
+        assert_eq!(resp::decode_cert(&payload).unwrap(), (&cert[..], sig));
+    }
+
+    #[test]
+    fn edited_certificates_are_rejected() {
+        let mut f = Fixture::new();
+        f.login();
+        let (_, _, mut cert, sig) = f.agent_key_with_cert(policy());
+        let id = f.hsm.identity_public();
+        let n = cert.len();
+        cert[n - 20] ^= 1; // somewhere in the policy
+        assert_eq!(
+            verify_key_cert(&id, &cert, &sig),
+            Err(CertError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn full_receiver_check_from_hsm_identity_to_action() {
+        let mut f = Fixture::new();
+        f.login();
+        let (key, _, cert, cert_sig) = f.agent_key_with_cert(policy());
+        let (other, _, other_cert, other_sig) = f.agent_key_with_cert(policy());
+        let action = Action {
+            kind: ActionKind::Payment,
+            amount: 1_000,
+            target: b"shop",
+            details: b"",
+            nonce: b"",
+            expires: 0,
+        };
+        let sign = |f: &mut Fixture, key| {
+            let (status, payload) = f.call(Request::SignAction {
+                key,
+                action,
+                confirmation: None,
+            });
+            assert_eq!(status, Status::Ok);
+            let (stmt, sig) = resp::decode_signed_action(&payload).unwrap();
+            (stmt.to_vec(), sig)
+        };
+        let (stmt, sig) = sign(&mut f, key);
+        let id = f.hsm.identity_public();
+
+        let (c, s) = verify_action(&id, &cert, &cert_sig, &stmt, &sig).unwrap();
+        assert_eq!(c.key, key);
+        assert_eq!(s.action, action);
+
+        // A statement from a different key does not pass with this certificate.
+        let (stmt2, sig2) = sign(&mut f, other);
+        assert!(verify_action(&id, &cert, &cert_sig, &stmt2, &sig2).is_err());
+        assert!(verify_action(&id, &other_cert, &other_sig, &stmt2, &sig2).is_ok());
+
+        // A different HSM's identity does not vouch for this key.
+        let stranger = SigningKey::from_bytes(&[77; 32]).verifying_key().to_bytes();
+        assert_eq!(
+            verify_action(&stranger, &cert, &cert_sig, &stmt, &sig),
+            Err(ActionError::Cert(CertError::BadSignature))
+        );
+    }
+
+    // ---- receiver's one-time code and expiry ----
+
+    fn pay_with<'a>(nonce: &'a [u8], expires: u64) -> Action<'a> {
+        Action {
+            kind: ActionKind::Payment,
+            amount: 1_000,
+            target: b"shop",
+            details: b"",
+            nonce,
+            expires,
+        }
+    }
+
+    #[test]
+    fn rules_can_require_a_receivers_one_time_code() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(Policy {
+            require_nonce: true,
+            ..policy()
+        });
+        let req = |f: &mut Fixture, a| {
+            f.call(Request::SignAction {
+                key: k.key,
+                action: a,
+                confirmation: None,
+            })
+        };
+        assert_eq!(req(&mut f, pay_with(b"", 0)).0, Status::NonceRequired);
+
+        let nonce = [0x5a; 16];
+        let (status, payload) = req(&mut f, pay_with(&nonce, 1_900_000_000));
+        assert_eq!(status, Status::Ok);
+        let (stmt, sig) = resp::decode_signed_action(&payload).unwrap();
+        let s = crate::agent::verify_statement(&k.public, stmt, &sig).unwrap();
+        assert_eq!(s.action.nonce, &nonce);
+        assert_eq!(s.action.expires, 1_900_000_000);
+    }
+
+    #[test]
+    fn short_codes_are_rejected() {
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(policy());
+        let mut buf = [0u8; MAX_FRAME];
+        let mut w = crate::wire::Writer::new(&mut buf);
+        w.u8(0x21).unwrap();
+        w.u32(k.key).unwrap();
+        w.u8(ActionKind::Payment as u8).unwrap();
+        w.u64(100).unwrap();
+        w.bytes(b"shop").unwrap();
+        w.bytes(b"").unwrap();
+        w.bytes(b"guessable").unwrap(); // 9 bytes: too short to be unguessable
+        w.u64(0).unwrap();
+        w.u8(0).unwrap();
+        let n = w.len();
+        assert_eq!(f.raw(&buf[..n]), vec![Status::BadRequest as u8]);
+    }
+
+    #[test]
+    fn the_users_approval_covers_the_code_and_expiry_too() {
+        let confirmer = SigningKey::from_bytes(&[9; 32]);
+        let mut f = Fixture::new();
+        f.login();
+        let k = f.agent_key(Policy {
+            confirm_above: 0,
+            confirmer: Some(confirmer.verifying_key().to_bytes()),
+            ..policy()
+        });
+        let approved = pay_with(&[1; 16], 1_900_000_000);
+        let (status, payload) = f.call(Request::GetChallenge);
+        assert_eq!(status, Status::Ok);
+        let challenge = resp::decode_challenge(&payload).unwrap();
+        let mut msg = [0u8; crate::agent::CONFIRM_MESSAGE_MAX];
+        let n = crate::agent::confirmation_message(
+            &mut msg,
+            b"TESTSERIAL000001",
+            &challenge,
+            k.key,
+            &approved,
+        )
+        .unwrap();
+        let conf = confirmer.sign(&msg[..n]).to_bytes();
+        // The agent stretches the expiry after the user approved.
+        let stretched = pay_with(&[1; 16], u64::MAX);
+        assert_eq!(
+            f.call(Request::SignAction {
+                key: k.key,
+                action: stretched,
+                confirmation: Some(conf)
+            })
+            .0,
+            Status::ConfirmationInvalid
+        );
     }
 }

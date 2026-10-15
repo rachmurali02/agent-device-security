@@ -326,6 +326,7 @@ dependencies = [
 name = "quorum-core"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek",
  "ed25519-dalek",
  "rand_core",
  "sha2",
@@ -350,6 +351,7 @@ dependencies = [
  "quorum-client",
  "quorum-core",
  "quorum-emulator",
+ "rand_core",
 ]
 
 [[package]]

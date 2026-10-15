@@ -76,7 +76,12 @@ fn status_to_rv(s: Status) -> CK_RV {
         | Status::BudgetExceeded
         | Status::ConfirmationRequired
         | Status::ConfirmationInvalid
-        | Status::NoChallenge => CKR_FUNCTION_REJECTED,
+        | Status::NoChallenge
+        | Status::NonceRequired => CKR_FUNCTION_REJECTED,
+        // Creating or deleting agent keys needs admin sign-off (quorum-cli).
+        Status::QuorumRequired | Status::ApprovalInvalid | Status::NoAdminChallenge => {
+            CKR_ACTION_PROHIBITED
+        }
     }
 }
 

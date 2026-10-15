@@ -21,6 +21,7 @@ const NO_POLICY: Policy = Policy {
     confirm_above: 0,
     always_confirm: 0,
     confirmer: None,
+    require_nonce: false,
 };
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -41,6 +42,8 @@ pub(crate) struct Slot {
     pub(crate) spent: u64,
     /// Agent keys: number of approved actions. Only ever goes up.
     pub(crate) approved: u64,
+    /// Agent keys: bitmask of the admins who approved creating the key.
+    pub(crate) approvers: u8,
 }
 
 impl Slot {
@@ -57,6 +60,7 @@ impl Slot {
         policy: NO_POLICY,
         spent: 0,
         approved: 0,
+        approvers: 0,
     };
 
     pub fn label(&self) -> &[u8] {
@@ -92,6 +96,7 @@ pub(crate) struct KeyMeta<'a> {
     pub policy: Policy,
     pub spent: u64,
     pub approved: u64,
+    pub approvers: u8,
 }
 
 impl<'a> KeyMeta<'a> {
@@ -103,13 +108,15 @@ impl<'a> KeyMeta<'a> {
             policy: NO_POLICY,
             spent: 0,
             approved: 0,
+            approvers: 0,
         }
     }
 
-    pub fn agent(label: &'a [u8], ext_id: &'a [u8], policy: Policy) -> Self {
+    pub fn agent(label: &'a [u8], ext_id: &'a [u8], policy: Policy, approvers: u8) -> Self {
         KeyMeta {
             usage: KeyUsage::Agent,
             policy,
+            approvers,
             ..Self::general(label, ext_id)
         }
     }
@@ -189,6 +196,7 @@ impl KeyStore {
             policy: meta.policy,
             spent: meta.spent,
             approved: meta.approved,
+            approvers: meta.approvers,
             ..Slot::EMPTY
         };
         slot.label[..meta.label.len()].copy_from_slice(meta.label);
