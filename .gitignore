@@ -5,3 +5,7 @@ target/
 bin/
 __pycache__/
 .venv/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/

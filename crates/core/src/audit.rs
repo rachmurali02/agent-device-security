@@ -47,10 +47,12 @@ pub enum Event {
     ActionRefused = 11,
     /// An admin operation was refused (not enough or invalid approvals).
     AdminRequestRefused = 12,
+    /// Two independent checks disagreed (a glitch?); the HSM stopped.
+    FaultDetected = 13,
 }
 
 impl Event {
-    pub const ALL: [Event; 12] = [
+    pub const ALL: [Event; 13] = [
         Event::Provisioned,
         Event::LoginOk,
         Event::LoginFailed,
@@ -63,6 +65,7 @@ impl Event {
         Event::ActionApproved,
         Event::ActionRefused,
         Event::AdminRequestRefused,
+        Event::FaultDetected,
     ];
 }
 

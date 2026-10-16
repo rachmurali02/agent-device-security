@@ -14,7 +14,7 @@ use quorum_core::{Hsm, Session, Storage};
 use rand_core::OsRng;
 
 mod storage;
-pub use storage::{RenameStorage, SLOT_FILE_LEN, SlotStorage};
+pub use storage::{RenameStorage, SLOT_FILE_LEN, SlotStorage, latest_slot};
 
 pub struct Device<S: Storage> {
     pub hsm: Hsm,

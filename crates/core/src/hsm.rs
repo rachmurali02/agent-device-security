@@ -17,6 +17,7 @@ use crate::agent::{
 };
 use crate::audit::{AUDIT_STATE_MAX, AuditLog, Checkpoint, Event, digest};
 use crate::cert::{KEYCERT_LEN, KeyCert};
+use crate::fault::{Glitch, Point};
 use crate::keystore::{KeyMeta, KeyStore, MAX_KEYS, SECRET_LEN, UseError};
 use crate::wire::{
     KeyUsage, MAX_EXT_ID, MAX_LABEL, MAX_PIN, MIN_PIN, Reader, Request, SERIAL_LEN, SIGNATURE_LEN,
@@ -120,10 +121,22 @@ pub struct Hsm {
     /// a restart cancels any proposal in progress.
     #[zeroize(skip)]
     admin_challenge: Option<[u8; CHALLENGE_LEN]>,
-    /// Set when storage fails. A faulted HSM refuses every command (fail
-    /// closed) until it restarts and reloads its last committed state.
+    /// Set when storage fails or a glitch is detected. A faulted HSM refuses
+    /// every command (fail closed) until it restarts and reloads its last
+    /// committed state.
     #[zeroize(skip)]
     faulted: bool,
+    /// Test-only glitch injection (a no-op in normal builds).
+    #[zeroize(skip)]
+    glitch: Glitch,
+}
+
+/// What the first check decided about an agent action, kept so the second,
+/// independent check can repeat it before anything is signed.
+struct Checked {
+    confirmed: bool,
+    /// The challenge and signature of the user's confirmation, if any.
+    confirmation: Option<([u8; CHALLENGE_LEN], [u8; SIGNATURE_LEN])>,
 }
 
 impl Hsm {
@@ -148,6 +161,7 @@ impl Hsm {
             admins,
             admin_challenge: None,
             faulted: false,
+            glitch: Glitch::default(),
         };
         rng.fill_bytes(&mut hsm.identity);
         hsm.pin[..p.pin.len()].copy_from_slice(p.pin);
@@ -172,6 +186,12 @@ impl Hsm {
 
     pub fn is_faulted(&self) -> bool {
         self.faulted
+    }
+
+    /// Test hook: flip the next decision made at `point` (see [`crate::fault`]).
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_glitch(&self, point: Point) {
+        self.glitch.arm(point);
     }
 
     /// Processes one request frame and writes the response frame into
@@ -476,7 +496,12 @@ impl Hsm {
         // even a refusal goes unrecorded.
         self.audit_room()?;
         match self.check_action(session, key, action, confirmation) {
-            Ok(confirmed) => self.approve_action(storage, key, action, confirmed, w),
+            Ok(checked) => {
+                if !self.action_still_allowed(key, action, &checked) {
+                    return Err(self.fault_detected(storage, key));
+                }
+                self.approve_action(storage, key, action, checked.confirmed, w)
+            }
             Err(status) => {
                 let mut buf = [0u8; MAX_STATEMENT];
                 let mut aw = Writer::new(&mut buf);
@@ -498,48 +523,107 @@ impl Hsm {
         key: u32,
         action: &Action<'_>,
         confirmation: Option<[u8; SIGNATURE_LEN]>,
-    ) -> Result<bool, Status> {
+    ) -> Result<Checked, Status> {
+        let g = &self.glitch;
         let slot = self.store.get(key).ok_or(Status::KeyNotFound)?;
-        if slot.usage != KeyUsage::Agent {
+        if !g.decide(Point::KeyUsage, slot.usage == KeyUsage::Agent) {
             return Err(Status::UsageNotAllowed);
         }
         let policy: Policy = slot.policy;
 
         // 1. Is this kind of action allowed at all?
-        if !policy.allows(action.kind) {
+        if !g.decide(Point::KindAllowed, policy.allows(action.kind)) {
             return Err(Status::ActionNotAllowed);
         }
         // 1b. Do the rules demand a receiver's one-time code?
-        if policy.require_nonce && action.nonce.is_empty() {
+        let nonce_ok = !(policy.require_nonce && action.nonce.is_empty());
+        if !g.decide(Point::NonceRule, nonce_ok) {
             return Err(Status::NonceRequired);
         }
         // 2. Is this single payment small enough?
-        if action.amount > policy.max_amount {
+        if !g.decide(Point::AmountCap, action.amount <= policy.max_amount) {
             return Err(Status::AmountTooHigh);
         }
         // 3. Would it go over the total budget?
-        match slot.spent.checked_add(action.amount) {
-            Some(total) if total <= policy.budget => {}
-            _ => return Err(Status::BudgetExceeded),
+        let fits = matches!(slot.spent.checked_add(action.amount), Some(t) if t <= policy.budget);
+        if !g.decide(Point::Budget, fits) {
+            return Err(Status::BudgetExceeded);
         }
         // 4. Does it need the user's confirmation, and is the one given real?
-        let confirmed = match confirmation {
+        match confirmation {
             Some(sig) => {
                 // A presented confirmation always uses up the challenge, so
                 // each one can be tried exactly once.
                 let challenge = session.challenge.take().ok_or(Status::NoChallenge)?;
-                let confirmer = policy.confirmer.ok_or(Status::ConfirmationInvalid)?;
-                if !confirmation_valid(&confirmer, &self.serial, &challenge, key, action, &sig) {
+                let valid = policy.confirmer.is_some_and(|c| {
+                    confirmation_valid(&c, &self.serial, &challenge, key, action, &sig)
+                });
+                if !g.decide(Point::ConfirmationValid, valid) {
                     return Err(Status::ConfirmationInvalid);
                 }
-                true
+                Ok(Checked {
+                    confirmed: true,
+                    confirmation: Some((challenge, sig)),
+                })
             }
-            None if policy.needs_confirmation(action) => {
-                return Err(Status::ConfirmationRequired);
+            None => {
+                let not_needed = !policy.needs_confirmation(action);
+                if !g.decide(Point::NoConfirmationNeeded, not_needed) {
+                    return Err(Status::ConfirmationRequired);
+                }
+                Ok(Checked {
+                    confirmed: false,
+                    confirmation: None,
+                })
             }
-            None => false,
+        }
+    }
+
+    /// The second check, made right before charging and signing. It repeats
+    /// every decision `check_action` made, written differently and with no
+    /// glitch hooks, and combines the results without short-circuiting. A
+    /// single glitch can fool one check, not both.
+    fn action_still_allowed(&self, key: u32, action: &Action<'_>, checked: &Checked) -> bool {
+        let Some(slot) = self.store.get(key) else {
+            return false;
         };
-        Ok(confirmed)
+        let p = &slot.policy;
+        let bit = action.kind.bit();
+        let usage_ok = matches!(slot.usage, KeyUsage::Agent);
+        let kind_ok = p.allowed & bit == bit;
+        let nonce_ok = !p.require_nonce || !action.nonce.is_empty();
+        let cap_ok = action.amount <= p.max_amount;
+        let budget_ok = p
+            .budget
+            .checked_sub(slot.spent)
+            .is_some_and(|left| action.amount <= left);
+        let confirm_ok = match &checked.confirmation {
+            Some((challenge, sig)) => {
+                checked.confirmed
+                    && p.confirmer.is_some_and(|c| {
+                        confirmation_valid(&c, &self.serial, challenge, key, action, sig)
+                    })
+            }
+            None => {
+                !checked.confirmed
+                    && p.always_confirm & bit == 0
+                    && action.amount <= p.confirm_above
+            }
+        };
+        usage_ok & kind_ok & nonce_ok & cap_ok & budget_ok & confirm_ok
+    }
+
+    /// The two checks disagreed, or a PIN or quorum re-check failed: record
+    /// it if possible, then stop until restart.
+    fn fault_detected(&mut self, storage: &mut impl Storage, key: u32) -> Status {
+        if self
+            .record(Event::FaultDetected, Status::Fault, key, 0, [0; 32])
+            .is_ok()
+        {
+            let _ = self.commit(storage);
+        }
+        self.faulted = true;
+        Status::Fault
     }
 
     fn approve_action(
@@ -627,6 +711,7 @@ impl Hsm {
         self.audit_room()?;
         match self.check_quorum(op, approvals) {
             Ok(approvers) => Ok(approvers),
+            Err(Status::Fault) => Err(self.fault_detected(storage, key)),
             Err(status) => {
                 let mut buf = [0u8; MAX_PROPOSAL];
                 let mut w = Writer::new(&mut buf);
@@ -664,12 +749,18 @@ impl Hsm {
         }
         .encode(&mut buf)
         .map_err(|_| Status::BadRequest)?;
-        self.admins
-            .check(&buf[..len], approvals)
-            .map_err(|e| match e {
-                QuorumError::NoAdmins | QuorumError::NotEnough => Status::QuorumRequired,
-                QuorumError::Invalid => Status::ApprovalInvalid,
-            })
+        let result = self.admins.check(&buf[..len], approvals);
+        if !self.glitch.decide(Point::QuorumMet, result.is_ok()) {
+            return Err(match result {
+                Err(QuorumError::Invalid) => Status::ApprovalInvalid,
+                _ => Status::QuorumRequired,
+            });
+        }
+        // Second, independent check before anything is changed.
+        match (result, self.admins.check(&buf[..len], approvals)) {
+            (Ok(a), Ok(b)) if a == b => Ok(a),
+            _ => Err(Status::Fault),
+        }
     }
 
     /// Writes an agent key's birth certificate and the identity signature.
@@ -715,7 +806,11 @@ impl Hsm {
         self.pin_tries_left -= 1;
         self.commit(storage)?;
 
-        if self.pin_matches(pin) {
+        if self.glitch.decide(Point::PinMatches, self.pin_matches(pin)) {
+            // Second, independent comparison before logging anyone in.
+            if !self.pin_matches_again(pin) {
+                return Err(self.fault_detected(storage, 0));
+            }
             self.pin_tries_left = MAX_PIN_TRIES;
             self.record(Event::LoginOk, Status::Ok, 0, 0, [0; 32])?;
             self.commit(storage)?;
@@ -745,6 +840,17 @@ impl Hsm {
         let same_len = self.pin_len.ct_eq(&(candidate.len() as u8));
         padded.zeroize();
         bool::from(same_bytes & same_len)
+    }
+
+    /// The PIN comparison again, done a different way (byte-by-byte XOR,
+    /// still constant-time) so one glitch can't fool both.
+    fn pin_matches_again(&self, candidate: &[u8]) -> bool {
+        let mut diff = (candidate.len() ^ self.pin_len as usize) as u32;
+        for i in 0..MAX_PIN {
+            let c = candidate.get(i).copied().unwrap_or(0);
+            diff |= (c ^ self.pin[i]) as u32;
+        }
+        diff == 0
     }
 
     fn commit(&mut self, storage: &mut impl Storage) -> Result<(), Status> {
@@ -818,6 +924,7 @@ impl Hsm {
             audit: AuditLog::read_state(&mut r).map_err(bad)?,
             admin_challenge: None,
             faulted: false,
+            glitch: Glitch::default(),
         };
         let pin_len = hsm.pin_len as usize;
         if !(MIN_PIN..=MAX_PIN).contains(&pin_len)
@@ -840,10 +947,19 @@ impl Hsm {
             let ext_id: [u8; MAX_EXT_ID] = r.array().map_err(bad)?;
             let mut secret: [u8; SECRET_LEN] = r.array().map_err(bad)?;
             let meta = read_key_meta(&mut r, &label, label_len, &ext_id, ext_len);
+            // Padding after the label and ID must be zero, as `save` writes
+            // it: one valid encoding per state. (Found by fuzzing.)
+            let padding_clean = label
+                .get(label_len..)
+                .is_some_and(|p| p.iter().all(|&b| b == 0))
+                && ext_id
+                    .get(ext_len..)
+                    .is_some_and(|p| p.iter().all(|&b| b == 0));
             let valid = id != 0
                 && id < next_id
                 && label_len <= MAX_LABEL
                 && ext_len <= MAX_EXT_ID
+                && padding_clean
                 && hsm.store.public_key(id).is_none();
             let inserted = match meta {
                 Ok(meta) if valid => hsm.store.insert_with_id(id, &secret, meta).is_ok(),

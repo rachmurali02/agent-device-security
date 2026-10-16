@@ -1,0 +1,50 @@
+[package]
+name = "quorum-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ed25519-dalek = "2"
+rand_core = "0.6"
+quorum-core = { path = "../crates/core" }
+quorum-emulator = { path = "../crates/emulator" }
+
+[[bin]]
+name = "wire_request"
+path = "fuzz_targets/wire_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hsm_commands"
+path = "fuzz_targets/hsm_commands.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_load"
+path = "fuzz_targets/state_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verifiers"
+path = "fuzz_targets/verifiers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slot_file"
+path = "fuzz_targets/slot_file.rs"
+test = false
+doc = false
+bench = false

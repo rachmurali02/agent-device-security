@@ -11,6 +11,7 @@ pub mod admin;
 pub mod agent;
 pub mod audit;
 pub mod cert;
+pub mod fault;
 pub mod hsm;
 pub mod keystore;
 pub mod wire;

@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
+# The fuzzer has its own workspace (it needs a nightly compiler).
+exclude = ["fuzz"]
 members = [
     "crates/core",
     "crates/emulator",

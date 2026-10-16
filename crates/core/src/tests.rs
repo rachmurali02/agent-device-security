@@ -37,10 +37,13 @@ struct MemStorage {
     state: Vec<u8>,
     commits: usize,
     fail: bool,
+    /// Fail the save with this number (counting from 0), as if the disk
+    /// died or power was cut at that exact moment.
+    fail_at: Option<usize>,
 }
 impl Storage for MemStorage {
     fn commit(&mut self, state: &[u8]) -> Result<(), StorageError> {
-        if self.fail {
+        if self.fail || self.fail_at == Some(self.commits) {
             return Err(StorageError);
         }
         self.state = state.to_vec();
@@ -1868,5 +1871,376 @@ mod milestone3 {
         .encode(&mut buf)
         .unwrap();
         assert_eq!(f.raw(&buf[..n]), vec![Status::BadRequest as u8]);
+    }
+}
+
+// ---- milestone 4: fault injection --------------------------------------------
+
+/// The disk fails at every possible save, one at a time, during a full
+/// scenario. Whatever happens, the HSM must never hand out a signature it
+/// didn't save the spending for, and must always restart cleanly.
+mod storage_faults {
+    use super::*;
+    use crate::admin::{AdminOp, Approvals};
+    use crate::agent::{Action, ActionKind, Policy};
+
+    fn policy() -> Policy {
+        Policy {
+            allowed: ActionKind::Payment.bit(),
+            max_amount: 1_000,
+            budget: 3_000,
+            confirm_above: 1_000,
+            always_confirm: 0,
+            confirmer: None,
+            require_nonce: false,
+        }
+    }
+
+    fn pay(cents: u64) -> Action<'static> {
+        Action {
+            kind: ActionKind::Payment,
+            amount: cents,
+            target: b"shop",
+            details: b"",
+            nonce: b"",
+            expires: 0,
+        }
+    }
+
+    /// Runs a scenario with the disk failing at save number `fail_at`.
+    /// Returns the sequence numbers of every approved action the HSM signed.
+    fn run(f: &mut Fixture, fail_at: Option<usize>) -> Vec<u64> {
+        f.storage.fail_at = fail_at.map(|n| n + f.storage.commits);
+        let mut signed = Vec::new();
+        let ok = |f: &mut Fixture, r: Request<'_>| f.call(r);
+        ok(f, Request::Login { pin: b"wrong!" });
+        ok(f, Request::Login { pin: PIN });
+        let (_, p) = ok(f, Request::GetAdminChallenge);
+        let Ok(challenge) = resp::decode_challenge(&p) else {
+            return signed;
+        };
+        let op = AdminOp::CreateAgentKey {
+            label: b"agent",
+            ext_id: b"",
+            policy: policy(),
+        };
+        let approvals = super::agent::sign_proposal(&challenge, &op, &[0, 1]);
+        let (st, p) = ok(
+            f,
+            Request::GenerateAgentKey {
+                label: b"agent",
+                ext_id: b"",
+                policy: policy(),
+                approvals,
+            },
+        );
+        if st != Status::Ok {
+            return signed;
+        }
+        let key = resp::AgentKeyCreated::decode(&p).unwrap().key;
+        for amount in [500, 5_000, 900, 800, 900, 700] {
+            let (st, p) = ok(
+                f,
+                Request::SignAction {
+                    key,
+                    action: pay(amount),
+                    confirmation: None,
+                },
+            );
+            if st == Status::Ok {
+                let (stmt, _) = resp::decode_signed_action(&p).unwrap();
+                signed.push(crate::agent::Statement::decode(stmt).unwrap().sequence);
+            }
+        }
+        let (_, p) = ok(f, Request::ReadAudit { from: 0 });
+        if let Ok(b) = resp::AuditBatch::decode(&p) {
+            ok(f, Request::AckAudit { upto: b.last_seq });
+        }
+        let _ = Approvals::default();
+        signed
+    }
+
+    #[test]
+    fn a_failing_disk_never_yields_an_unsaved_signature() {
+        // How many saves does the scenario make when nothing fails?
+        let mut f = Fixture::new();
+        let start = f.storage.commits;
+        let all = run(&mut f, None);
+        let saves = f.storage.commits - start;
+        assert_eq!(all, vec![1, 2, 3, 4]);
+        assert!(saves > 10);
+
+        for fail_at in 0..saves {
+            let mut f = Fixture::new();
+            let signed = run(&mut f, Some(fail_at));
+            // After the failure the HSM refuses everything.
+            assert!(f.hsm.is_faulted(), "save {fail_at}: should have stopped");
+            assert_eq!(f.call(Request::GetInfo).0, Status::Fault);
+
+            // Restart from what was really saved.
+            let reloaded = Hsm::load(&f.storage.state)
+                .unwrap_or_else(|e| panic!("save {fail_at}: state doesn't reload: {e:?}"));
+            f.hsm = reloaded;
+            f.session = Session::default();
+            f.storage.fail_at = None;
+            f.login();
+            let (st, p) = f.call(Request::GetKeyPolicy { key: 1 });
+            let saved_approvals = if st == Status::Ok {
+                resp::KeyPolicy::decode(&p).unwrap().approved
+            } else {
+                0
+            };
+            // Every signature handed out is covered by saved spending.
+            assert!(
+                signed.iter().all(|&seq| seq <= saved_approvals),
+                "save {fail_at}: signed {signed:?} but only {saved_approvals} saved"
+            );
+            // And the budget can't be exceeded after the restart either.
+            if st == Status::Ok {
+                let kp = resp::KeyPolicy::decode(&p).unwrap();
+                assert!(kp.spent <= kp.policy.budget);
+            }
+        }
+    }
+}
+
+/// One glitch at a time: each security decision is flipped on purpose.
+/// Run with `cargo test -p quorum-core --features fault-injection`.
+#[cfg(feature = "fault-injection")]
+mod glitches {
+    use super::agent::sign_proposal;
+    use super::*;
+    use crate::admin::{AdminOp, Approvals};
+    use crate::agent::{Action, ActionKind, CONFIRM_MESSAGE_MAX, Policy, confirmation_message};
+    use crate::audit::{Entry, Event};
+    use crate::fault::Point;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn phone() -> SigningKey {
+        SigningKey::from_bytes(&[9; 32])
+    }
+
+    fn policy() -> Policy {
+        Policy {
+            allowed: ActionKind::Payment.bit(),
+            max_amount: 1_000,
+            budget: 2_000,
+            confirm_above: 500,
+            always_confirm: 0,
+            confirmer: Some(phone().verifying_key().to_bytes()),
+            require_nonce: true,
+        }
+    }
+
+    fn pay(cents: u64) -> Action<'static> {
+        Action {
+            kind: ActionKind::Payment,
+            amount: cents,
+            target: b"shop",
+            details: b"",
+            nonce: &[7; 16],
+            expires: 0,
+        }
+    }
+
+    fn act(f: &mut Fixture, key: u32, a: Action<'_>, conf: Option<[u8; 64]>) -> Status {
+        f.call(Request::SignAction {
+            key,
+            action: a,
+            confirmation: conf,
+        })
+        .0
+    }
+
+    fn confirm(f: &mut Fixture, key: u32, a: &Action<'_>, by: &SigningKey) -> [u8; 64] {
+        let (_, p) = f.call(Request::GetChallenge);
+        let challenge = resp::decode_challenge(&p).unwrap();
+        let mut msg = [0u8; CONFIRM_MESSAGE_MAX];
+        let n = confirmation_message(&mut msg, b"TESTSERIAL000001", &challenge, key, a).unwrap();
+        by.sign(&msg[..n]).to_bytes()
+    }
+
+    /// After a detected glitch: everything is refused, nothing was charged,
+    /// and after a restart the event is in the audit log.
+    fn assert_caught(f: &mut Fixture, spent_before: u64, key: u32) {
+        assert!(f.hsm.is_faulted());
+        assert_eq!(f.call(Request::GetInfo).0, Status::Fault);
+        f.hsm = Hsm::load(&f.storage.state).unwrap();
+        f.session = Session::default();
+        let (_, p) = f.call(Request::ReadAudit { from: 0 });
+        let batch = resp::AuditBatch::decode(&p).unwrap();
+        assert!(
+            batch
+                .entries()
+                .any(|e| Entry::decode(e).unwrap().event == Event::FaultDetected)
+        );
+        if key != 0 {
+            let (_, p) = f.call(Request::GetKeyPolicy { key });
+            assert_eq!(resp::KeyPolicy::decode(&p).unwrap().spent, spent_before);
+        }
+    }
+
+    /// Each case: a request the rules refuse because of exactly one check,
+    /// with that one check glitched to say "yes".
+    #[test]
+    fn one_glitched_check_never_produces_a_signature() {
+        let cases: [(Point, &str); 6] = [
+            (Point::KindAllowed, "a kind of action the rules forbid"),
+            (Point::NonceRule, "no receiver's code when one is required"),
+            (Point::AmountCap, "a payment over the cap"),
+            (Point::Budget, "a payment over the budget"),
+            (
+                Point::NoConfirmationNeeded,
+                "no user confirmation when one is needed",
+            ),
+            (
+                Point::ConfirmationValid,
+                "a confirmation from the wrong phone",
+            ),
+        ];
+        for (point, what) in cases {
+            let mut f = Fixture::new();
+            f.login();
+            let key = f.agent_key(policy()).key;
+            // Spend $19 of the $20 budget first.
+            for amount in [500, 500, 500, 400] {
+                assert_eq!(act(&mut f, key, pay(amount), None), Status::Ok);
+            }
+            let (status, conf) = match point {
+                Point::KindAllowed => {
+                    let a = Action {
+                        kind: ActionKind::DeleteData,
+                        amount: 0,
+                        ..pay(0)
+                    };
+                    f.hsm.inject_glitch(point);
+                    (act(&mut f, key, a, None), ())
+                }
+                Point::NonceRule => {
+                    f.hsm.inject_glitch(point);
+                    (
+                        act(
+                            &mut f,
+                            key,
+                            Action {
+                                nonce: b"",
+                                ..pay(100)
+                            },
+                            None,
+                        ),
+                        (),
+                    )
+                }
+                Point::AmountCap => {
+                    // Over the $10 cap, within budget, confirmed by the user.
+                    let mut g = Fixture::new();
+                    g.login();
+                    let k2 = g.agent_key(policy()).key;
+                    let c = confirm(&mut g, k2, &pay(1_200), &phone());
+                    g.hsm.inject_glitch(point);
+                    let st = act(&mut g, k2, pay(1_200), Some(c));
+                    assert_eq!(st, Status::Fault, "{what}");
+                    assert_caught(&mut g, 0, k2);
+                    continue;
+                }
+                Point::Budget => {
+                    // $2 more would make $21: over budget, nothing else wrong.
+                    f.hsm.inject_glitch(point);
+                    (act(&mut f, key, pay(200), None), ())
+                }
+                Point::NoConfirmationNeeded => {
+                    let mut g = Fixture::new();
+                    g.login();
+                    let k2 = g.agent_key(policy()).key;
+                    g.hsm.inject_glitch(point);
+                    let st = act(&mut g, k2, pay(800), None);
+                    assert_eq!(st, Status::Fault, "{what}");
+                    assert_caught(&mut g, 0, k2);
+                    continue;
+                }
+                Point::ConfirmationValid => {
+                    let mut g = Fixture::new();
+                    g.login();
+                    let k2 = g.agent_key(policy()).key;
+                    let impostor = SigningKey::from_bytes(&[66; 32]);
+                    let c = confirm(&mut g, k2, &pay(800), &impostor);
+                    g.hsm.inject_glitch(point);
+                    let st = act(&mut g, k2, pay(800), Some(c));
+                    assert_eq!(st, Status::Fault, "{what}");
+                    assert_caught(&mut g, 0, k2);
+                    continue;
+                }
+                _ => unreachable!(),
+            };
+            let () = conf;
+            assert_eq!(status, Status::Fault, "{what}");
+            assert_caught(&mut f, 1_900, key);
+        }
+    }
+
+    #[test]
+    fn a_glitched_key_type_check_still_signs_nothing() {
+        let mut f = Fixture::new();
+        f.login();
+        let general = f.generate(b"general").key;
+        f.hsm.inject_glitch(Point::KeyUsage);
+        // Ordinary keys have no rules, so the next check refuses anyway.
+        assert_ne!(act(&mut f, general, pay(1), None), Status::Ok);
+    }
+
+    #[test]
+    fn a_glitched_pin_check_does_not_log_anyone_in() {
+        let mut f = Fixture::new();
+        f.hsm.inject_glitch(Point::PinMatches);
+        assert_eq!(f.call(Request::Login { pin: b"000000" }).0, Status::Fault);
+        assert!(!f.session.is_logged_in());
+        assert_caught(&mut f, 0, 0);
+    }
+
+    #[test]
+    fn a_glitched_quorum_check_creates_no_key() {
+        let mut f = Fixture::new();
+        f.login();
+        let op = AdminOp::CreateAgentKey {
+            label: b"rogue",
+            ext_id: b"",
+            policy: policy(),
+        };
+        let (_, p) = f.call(Request::GetAdminChallenge);
+        let challenge = resp::decode_challenge(&p).unwrap();
+        let one_admin = sign_proposal(&challenge, &op, &[0]);
+        f.hsm.inject_glitch(Point::QuorumMet);
+        let st = f
+            .call(Request::GenerateAgentKey {
+                label: b"rogue",
+                ext_id: b"",
+                policy: policy(),
+                approvals: one_admin,
+            })
+            .0;
+        assert_eq!(st, Status::Fault);
+        assert_caught(&mut f, 0, 0);
+        let (_, p) = f.call(Request::ListKeys);
+        assert_eq!(resp::decode_key_list(&p).unwrap().count(), 0);
+        let _ = Approvals::default();
+    }
+
+    #[test]
+    fn a_glitch_in_the_safe_direction_just_refuses() {
+        // Flipping "allowed" to "refused" is harmless: the action is refused,
+        // recorded, and the HSM keeps working.
+        let mut f = Fixture::new();
+        f.login();
+        let key = f.agent_key(policy()).key;
+        f.hsm.inject_glitch(Point::AmountCap);
+        assert_eq!(act(&mut f, key, pay(100), None), Status::AmountTooHigh);
+        assert!(!f.hsm.is_faulted());
+        assert_eq!(act(&mut f, key, pay(100), None), Status::Ok);
+    }
+
+    #[test]
+    fn every_decision_point_is_covered_by_a_test() {
+        // Guard: adding a new glitch point without a test fails here.
+        assert_eq!(Point::ALL.len(), 9);
     }
 }

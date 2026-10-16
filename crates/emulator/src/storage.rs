@@ -148,8 +148,9 @@ fn parse_slot(slot: &[u8]) -> Option<(u64, &[u8])> {
     (hash == expected).then_some((seq, state))
 }
 
-/// The valid slot with the highest sequence number.
-fn latest_slot(file: &[u8]) -> Option<(u64, &[u8])> {
+/// The valid slot with the highest sequence number. Public so the fuzzer
+/// can feed it arbitrary file images.
+pub fn latest_slot(file: &[u8]) -> Option<(u64, &[u8])> {
     file.chunks(SLOT_LEN)
         .filter_map(parse_slot)
         .max_by_key(|(seq, _)| *seq)

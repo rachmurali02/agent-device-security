@@ -2,9 +2,9 @@
 
 **Short answer:** yes, for our threat (someone controls the computer and knows
 the PIN). It's the only option tested that blocks the attacks: **8 of 8**,
-against 1 of 8 for the conventional setup. After switching to two-slot
-storage, an agent action that is safely saved to disk takes about **0.28
-milliseconds**. That's about 75 µs more than the conventional setup keeping
+against 1 of 8 for the conventional setup. With two-slot storage and glitch
+double-checks, an agent action that is safely saved to disk takes about
+**0.24–0.29 milliseconds**. That's about 75 µs more than the conventional setup keeping
 its counters only in memory, and less than the conventional setup saving
 them to disk.
 
@@ -61,18 +61,18 @@ all three are in [`benchmarks/runs/`](benchmarks/runs/).
 
 | What | quorum-hsm | SoftHSM2 | No HSM |
 |---|---:|---:|---:|
-| Sign a message (median) | **107–129 µs** | 198–201 µs | 17 µs |
-| Create a key (median) | **0.37–0.51 ms** | 10.5–14.1 ms | n/a |
-| Approve an agent action, saved safely to disk | **265–305 µs** | 426–479 µs ¹ | n/a |
-| …with counters only in memory (SoftHSM2) / without waiting for the disk (ours, unsafe) | 107–132 µs | 208–212 µs ¹ | n/a |
-| Approve an action that needs the user's OK | 532–558 µs | not possible ² | n/a |
-| **Refuse** an action (the refusal is recorded and saved) | 172–194 µs | <1 µs, nothing recorded ¹ | n/a |
-| Create an agent key with 2-of-3 sign-off + certificate, then delete it | 1.6–1.7 ms | not possible ² | n/a |
-| Change an agent key's rules with 2-of-3 sign-off + new certificate | 0.66–0.89 ms | not possible ² | n/a |
-| Receiver checks a signed action (no HSM needed) | 124–126 µs | n/a | n/a |
-| Auditor checks a 1,000-entry log against a checkpoint (no HSM needed) | 214–228 µs | not possible ² | n/a |
-| Signatures per second, 1 thread → 4 threads | ~8,100 → ~5,900 | ~4,700 → ~7,400 | n/a |
-| Agent actions per second, 1 thread → 4 threads | ~2,900 → ~2,700 | n/a | n/a |
+| Sign a message (median) | **113–133 µs** | 194–199 µs | 17 µs |
+| Create a key (median) | **0.43–0.62 ms** | 11.0–12.1 ms | n/a |
+| Approve an agent action, saved safely to disk | **235–294 µs** | 429–446 µs ¹ | n/a |
+| …with counters only in memory (SoftHSM2) / without waiting for the disk (ours, unsafe) | 100–110 µs | 205–214 µs ¹ | n/a |
+| Approve an action that needs the user's OK | 536–571 µs | not possible ² | n/a |
+| **Refuse** an action (the refusal is recorded and saved) | 164–198 µs | <1 µs, nothing recorded ¹ | n/a |
+| Create an agent key with 2-of-3 sign-off + certificate, then delete it | 1.6–2.1 ms | not possible ² | n/a |
+| Change an agent key's rules with 2-of-3 sign-off + new certificate | 0.81–1.05 ms | not possible ² | n/a |
+| Receiver checks a signed action (no HSM needed) | 125 µs | n/a | n/a |
+| Auditor checks a 1,000-entry log against a checkpoint (no HSM needed) | 228–246 µs | not possible ² | n/a |
+| Signatures per second, 1 thread → 4 threads | ~8,600 → ~6,700 | ~5,000 → ~7,900 | n/a |
+| Agent actions per second, 1 thread → 4 threads | ~2,700 → ~3,000 | n/a | n/a |
 
 ¹ The rules run on the computer, so these are the steps an attacker can skip (see below).
 ² SoftHSM2 has no way to do this inside the HSM.
@@ -160,13 +160,32 @@ storage next to the new one.
 ³ From the milestone 3 runs, which used the old storage; only the first row
 was measured side by side in this run.
 
+### The cost of glitch resistance (milestone 4)
+
+Every decision that leads to a signature, a login or an admin change is now
+made twice, by separate code. Same benchmark, before and after:
+
+| What | Before | After | Why |
+|---|---:|---:|---|
+| Rule check for an agent action, inside the core | 55.2 µs | 54.9 µs | The second check is a few comparisons: too small to measure |
+| Action with the user's confirmation | 535 µs | 567 µs | The phone's signature is checked twice (+~30 µs) |
+| Create + delete an agent key | 1.59 ms | 1.88 ms | Admin signatures are checked twice for each of the two operations |
+| Change a key's rules | 0.81 ms | 0.94 ms | Same reason, once |
+
+Ordinary actions pay nothing measurable; the rare operations that involve
+extra signatures pay for checking them twice.
+
 ### What changed since milestone 2
 
-| What | Milestone 2 | Milestone 3 | Milestone 3 + two-slot storage |
-|---|---:|---:|---:|
-| Approve an agent action, saved safely | ~729 µs | ~821 µs | **~284 µs** |
-| Rule check inside the core | ~53 µs | ~55 µs | ~55 µs |
-| Attacks blocked | 6 of 6 | 8 of 8 | **8 of 8** |
+| What | Milestone 2 | Milestone 3 | + two-slot storage | Milestone 4 (+ double checks) |
+|---|---:|---:|---:|---:|
+| Approve an agent action, saved safely | ~729 µs | ~821 µs | ~284 µs | **~242 µs** ⁴ |
+| Rule check inside the core | ~53 µs | ~55 µs | ~55 µs | ~55 µs |
+| Attacks blocked | 6 of 6 | 8 of 8 | 8 of 8 | **8 of 8** |
+
+⁴ Lower than the column before it because the disk was faster in this run
+(the old-storage row on the same disk also dropped ~10%), not because of
+the code.
 
 The audit log added about 10–15% to each action. Two-slot storage then took
 away nearly two-thirds of the total. (The machine was restarted between some
@@ -197,8 +216,8 @@ real hardware is the way to fill in the speed column for these.
   and the audit log must all live inside the HSM. The conventional setup can't
   stop an attacker who skips a check, edits the rules or deletes a log line.
   The attack table shows each of these directly.
-- **For speed:** a fully checked, logged and safely saved agent action takes
-  about 0.28 ms on this machine. That's tiny next to a person tapping
+- **For speed:** a fully checked, double-checked, logged and safely saved
+  agent action takes about a quarter of a millisecond on this machine. That's tiny next to a person tapping
   "Approve" or a network payment.
 - **For production:** run this same core on hardware that accepts custom code
   (a TEE, a secure microcontroller, or a commercial HSM with a firmware SDK).

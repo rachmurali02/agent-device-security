@@ -28,10 +28,38 @@ of them.
 **Does it work, and what does it cost?** We benchmarked it against SoftHSM2, the
 standard open-source HSM, used the conventional way, with the rules checked on
 the computer. We also ran eight attacks against both. **Ours blocked 8 of 8; the
-conventional setup blocked 1.** A fully checked, logged and safely saved
-agent action takes about 0.28 ms. Details in [Benchmarks](#benchmarks).
+conventional setup blocked 1.** A fully checked, double-checked, logged and
+safely saved agent action takes about a quarter of a millisecond. Details in
+[Benchmarks](#benchmarks).
 
 ## What works today
+
+### Milestone 4: attacking it on purpose ✅
+
+- **Glitch resistance.** Attackers with the device in hand can disturb a
+  chip's power or clock to flip a single decision, like "over budget"
+  becoming "fine". Now every decision that leads to a signature, a login or
+  an admin change is made **twice, by separate code**. If the two disagree,
+  the HSM records a "fault detected" entry and stops. A test-only switch
+  flips each of the 9 decisions in turn, to prove one glitch never gets a
+  signature through.
+- **Disk failures at every moment.** A test runs a whole scenario and makes
+  the disk fail at each save in turn. The HSM always stops cleanly, restarts
+  from what was saved, and never handed out a signature it hadn't saved the
+  spending for.
+- **Fuzzing.** The fuzzer feeds the HSM millions of random and mutated
+  inputs, and checks rules that must always hold. One target plays whole
+  random sessions (logins, admin requests with forged approvals, tampered
+  confirmations, garbage) and checks after every step that:
+  - every approved action obeyed its key's rules
+  - the saved state reloads
+  - the audit log still verifies
+- **The fuzzer found a real bug within seconds.** Saved state with junk
+  hidden in a label's padding was accepted. It's fixed, and that input is
+  kept as a permanent test.
+- **A threat model** ([`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)): what
+  we protect, from whom, the 21 threats we handle, the test that proves each
+  one, and what isn't covered yet.
 
 ### Milestone 3: changing things safely, and a record nobody can quietly edit ✅
 
@@ -146,8 +174,7 @@ HSM checks, in order:  allowed kind? → under the per-payment limit? →
 - Signatures check out with OpenSSL, separate software that shares no code with this project.
 - The core code builds for a real $5 microcontroller chip (Raspberry Pi RP2350),
   not just for a PC.
-- 77 automated tests, two demo scripts that run everything from start to
-  finish, and a benchmark that measures speed and runs attacks.
+- Tested many ways: see [How it's tested](#how-its-tested).
 
 ## Try it
 
@@ -253,6 +280,20 @@ $Q audit show --log audit.log
 ```
 </details>
 
+## How it's tested
+
+| Kind | What it proves | Run it |
+|---|---|---|
+| Unit and scenario tests (80) | Every rule, refusal and attack scenario behaves as designed | `cargo test --workspace` |
+| Glitch tests (6 more) | Flipping any one security decision never yields a signature, login or key | `cargo test -p quorum-core --features fault-injection` |
+| Disk-failure test | Failing the disk at every possible save never yields an unsaved signature | (part of the unit tests) |
+| Power-cut test | A save cut off at any byte leaves the previous state intact | (part of the unit tests) |
+| Fuzzing (5 targets) | Millions of random inputs: no crashes, one encoding per message, rules always hold | `./scripts/fuzz.sh 60` |
+| Benchmark attacks (8) | Real attacks against our HSM and SoftHSM2; fails if any gets through ours | `./scripts/bench.sh` |
+| Demos | The full stories, end to end, with real tools (`pkcs11-tool`, OpenSSL) | `./scripts/demo-agent.sh` |
+
+All of these run on every push in GitHub Actions.
+
 ## How the pieces fit together
 
 ```
@@ -274,10 +315,12 @@ $Q audit show --log audit.log
 | `crates/cli` | `quorum` | The command-line tool: admins, agent actions, shops, the audit log. |
 | `crates/client` | `quorum-client` | The small piece that connects programs to the HSM. |
 | `crates/bench` | `quorum-bench` | Measures speed and runs attacks, against our HSM and SoftHSM2. |
+| `fuzz/` | Fuzz targets | Random-input testing (needs a nightly compiler). |
 | `scripts/demo-agent.sh` | Demo | The AI-agent story with one command. |
 | `scripts/demo.sh` | Demo | The basics with one command. |
 | `tools/` | Helpers | A code generator for the adapter, and the chart drawer. |
 | `docs/BENCHMARKS.md` | Report | Benchmark results and what they mean. |
+| `docs/THREAT_MODEL.md` | Report | What we protect, from whom, and how we know it works. |
 | `docs/IDEAS.md` | Roadmap | Where the project is going. |
 
 ## Security choices, explained simply
@@ -289,6 +332,8 @@ $Q audit show --log audit.log
 | **The PIN check takes the same time whether you're close or way off.** | Timing can't leak how many digits were right. |
 | **If saving fails, the HSM stops working** until it restarts. | It would rather refuse than continue in an unknown state ("fail closed"). |
 | **State is saved in two alternating slots, each with a hash.** | A power cut mid-save leaves the previous state intact; a test cuts a save off at every byte to prove it. |
+| **Every security decision is made twice, by separate code.** | One hardware glitch can't turn a "no" into a signature; a mismatch stops the HSM. |
+| **Saved state must have exactly one valid form** (no junk in padding). | Tampered or corrupted state is refused instead of half-trusted. Found by fuzzing. |
 | **Deleted key numbers are never reused.** | An old reference can't accidentally point at a new key. |
 | **The core is written without `unsafe` code** and without needing an operating system. | Rust checks it for whole classes of memory bugs, and it can run on a tiny chip. |
 | **Every message from outside is checked strictly**: exact lengths, no extra bytes. | Malformed input is rejected instead of guessed at. |
@@ -312,7 +357,10 @@ $Q audit show --log audit.log
 ## Not done yet (honest limitations)
 
 - The emulator is software pretending to be hardware. It is **not** real
-  hardware protection yet.
+  hardware protection yet: no protection against reading keys out of the
+  chip, or against power-analysis attacks.
+- The double checks handle **one** glitch per operation; several coordinated
+  glitches need hardware sensors.
 - The HSM's saved state file (keys and PIN) is **not encrypted** yet. Encrypting
   it with a key unique to each device is on the roadmap.
 - The audit log makes deletion *detectable*, not impossible. If the only
@@ -340,8 +388,8 @@ $Q audit show --log audit.log
 | 1 | Working HSM: keys, PIN, signing, PKCS#11, tests | ✅ Done |
 | 2 | Rules inside the HSM for agent actions (limits, budget, user confirmation) | ✅ Done |
 | 3 | Sign-off from several admins for key creation, deletion, rule changes and admin changes; birth certificates; tamper-evident audit log | ✅ Done |
-| 4 | **Fuzzing (feeding random input to find crashes) and fault-injection tests** | Next |
-| 5 | Run on a real chip (Raspberry Pi RP2350) with secure boot | Planned |
+| 4 | Fuzzing, glitch (fault-injection) tests, disk-failure tests, threat model | ✅ Done |
+| 5 | **Run on a real chip (Raspberry Pi RP2350) with secure boot** | Next |
 
 More detail in [`docs/IDEAS.md`](docs/IDEAS.md).
 
@@ -358,10 +406,10 @@ each. The full report, with what the numbers mean, is in
 | | quorum-hsm (rules inside the HSM) | SoftHSM2 (rules on the computer) |
 |---|---|---|
 | Attacks blocked | **8 of 8** | 1 of 8 |
-| Sign a message | ~110 µs | ~200 µs |
-| Approve an agent action, saved safely | **~0.28 ms** | ~0.47 ms (and an attacker can skip the rules) |
+| Sign a message | ~115 µs | ~195 µs |
+| Approve an agent action, saved safely | **~0.24 ms** | ~0.44 ms (and an attacker can skip the rules) |
 | Refuse an action | ~0.18 ms (recorded in the audit log) | <1 µs (nothing recorded) |
-| Change a key's rules (2 of 3 admins) | ~0.8 ms | not possible |
+| Change a key's rules (2 of 3 admins) | ~0.9 ms | not possible |
 | Create a key | ~0.5 ms | ~12 ms |
 
 **What we learned:**
@@ -375,6 +423,8 @@ each. The full report, with what the numbers mean, is in
   save off at every byte to prove a power cut can never corrupt the state.
 - A refusal is saved before the HSM answers. That costs a disk write, and
   it's the price of leaving no untraceable attempts.
+- Glitch double-checks cost nothing measurable on ordinary actions; actions
+  and admin changes that carry extra signatures pay ~30–150 µs to check them twice.
 - SoftHSM2 handles many requests at once better than our emulator does.
 
 Fixed-function HSMs, like most cloud HSMs and YubiHSM 2, can't run custom
@@ -410,3 +460,7 @@ secure microcontroller, or a commercial HSM with a firmware SDK.
 - **Checkpoint**: the HSM's signed statement "the log up to entry N ends in this fingerprint".
 - **Audit collector**: a program that regularly copies the log out of the HSM and keeps it safe.
 - **Rules version**: goes up by one each time admins change an agent key's rules; shown on its birth certificate.
+- **Two-slot (A/B) storage**: saving into whichever of two slots is older, so a power cut mid-save always leaves the other one intact.
+- **Glitch / fault injection**: disturbing a chip so it makes one wrong decision; in tests, we flip decisions on purpose.
+- **Fuzzing**: feeding a program huge numbers of random or mutated inputs to find crashes and broken rules.
+- **Threat model**: a list of what we protect, from whom, and how.

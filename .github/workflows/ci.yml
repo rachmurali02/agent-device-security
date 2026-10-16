@@ -18,9 +18,33 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Glitch tests (one security decision flipped at a time)
+        run: cargo test -p quorum-core --features fault-injection
       - name: Core builds for the RP2350 microcontroller (no OS)
         run: cargo build -p quorum-core --release --target thumbv8m.main-none-eabihf
       - run: ./scripts/demo.sh
       - run: ./scripts/demo-agent.sh
       - name: Benchmark smoke test (small run; checks the harness and attacks still work)
         run: cargo build --release -p quorum-bench && target/release/quorum-bench --iterations 50 --data /tmp/run.tsv && tools/plot_benchmarks.py /tmp/run.tsv > /dev/null
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-14  # keep in sync with scripts/fuzz.sh
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz every target for 60 seconds
+        run: |
+          for t in wire_request state_load verifiers slot_file hsm_commands; do
+            extra=""
+            [ "$t" = hsm_commands ] && extra="-max_len=2048"
+            cargo +nightly-2026-10-14 fuzz run -O "$t" -- -max_total_time=60 $extra
+          done
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

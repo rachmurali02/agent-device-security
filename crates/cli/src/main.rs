@@ -1046,6 +1046,9 @@ fn audit_show(log: &Path) -> Result<()> {
                 refusal(e.status)
             ),
             Event::AdminRequestRefused => format!("admin request REFUSED: {}", refusal(e.status)),
+            Event::FaultDetected => {
+                "FAULT DETECTED: two checks disagreed; the HSM stopped".to_string()
+            }
         };
         println!("#{:<5} {what}", e.seq);
     }
