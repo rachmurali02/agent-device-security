@@ -2,7 +2,7 @@
 *.key
 *.pem
 target/
-bin/
+/bin/
 __pycache__/
 .venv/
 fuzz/target/
