@@ -36,6 +36,30 @@ safely saved agent action takes about a quarter of a millisecond. Details in
 
 ## What works today
 
+### Experiments: under load, and 20 more attacks 🧪
+
+[`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) has the details; `./scripts/lab.sh` reruns everything.
+
+- **Under load** (up to 64 clients at once): about 3,500 safely saved
+  payments a second, whatever the number of clients. Extra clients wait in
+  line (median 2.3 ms with 8 clients, 14 ms with 64), and nobody is starved.
+  After 72,116 payments from competing clients, the spending counter was
+  exact and no action number was used twice.
+- **Killed mid-traffic, 25 times** (`kill -9`): every restart picked up where
+  it left off. No client ever got a signature the HSM hadn't counted, and no
+  action number was handed out twice.
+- **Who can slow it down?** Without the PIN, hardly anyone (1.1–1.6x, even
+  with floods, garbage or 200 idle connections). With the PIN, flooding
+  slows others 6–9x. Fixing that is a to-do.
+- **20 more attacks, each carried out:** 15 blocked, 2 stopped by the
+  receiving shop, 1 detected, 2 work. One of the two is a **new finding**:
+  someone with only the PIN can fill all 16 key slots, so admins can't
+  create agent keys. The other is the known rollback gap (putting back an
+  old copy of the state undoes spending).
+- **A lesson in measuring:** our first PIN-timing test "found" a leak. It
+  turned out to measure the order of the guesses, not the PIN; with a random
+  order, the difference vanished.
+
 ### Milestone 5: on a real chip ✅ (waiting for the board)
 
 - **Firmware for RP2350 boards**: the Raspberry Pi Pico 2 and the Seeed
@@ -329,6 +353,7 @@ $Q audit show --log audit.log
 | Power-cut tests | A save cut off at any byte leaves the previous state intact, on disk and on (simulated) flash, including mid-erase | (part of the unit tests) |
 | Fuzzing (6 targets) | Millions of random inputs: no crashes, one encoding per message, rules always hold; a board booting from any flash contents | `./scripts/fuzz.sh 60` |
 | Benchmark attacks (8) | Real attacks against our HSM and SoftHSM2; fails if any gets through ours | `./scripts/bench.sh` |
+| Lab: load + 20 attacks | Behaviour under load, floods and `kill -9`; 20 more attacks with expected outcomes; fails on any surprise | `./scripts/lab.sh` |
 | Demos | The full stories, end to end, with real tools (`pkcs11-tool`, OpenSSL) and a simulated board over a serial port | `./scripts/demo-agent.sh`, `./scripts/demo-board.sh` |
 | Firmware build | The firmware for both boards compiles, passes the linter, and converts to `.uf2` | `./scripts/firmware.sh` |
 
@@ -366,10 +391,12 @@ real board needs: starting blank, provisioning, and saving to flash.
 | `scripts/demo-agent.sh` | Demo | The AI-agent story with one command. |
 | `scripts/demo-board.sh` | Demo | A brand-new board's life, with a simulated board. |
 | `scripts/demo.sh` | Demo | The basics with one command. |
+| `scripts/lab.sh` | Experiments | Load tests and 20 more attacks (`quorum-lab`). |
 | `scripts/firmware.sh` | Build | Builds the board firmware (`.elf` and `.uf2`, one per board). |
 | `tools/` | Helpers | A code generator for the adapter, the chart drawer, and the `.uf2` converter. |
 | `docs/HARDWARE.md` | Guide | Buying, flashing and provisioning a board; what to test on it; secure boot. |
 | `docs/BENCHMARKS.md` | Report | Benchmark results and what they mean. |
+| `docs/EXPERIMENTS.md` | Report | Load tests and extra attacks: results and what they mean. |
 | `docs/THREAT_MODEL.md` | Report | What we protect, from whom, and how we know it works. |
 | `docs/IDEAS.md` | Roadmap | Where the project is going. |
 
@@ -424,7 +451,11 @@ real board needs: starting blank, provisioning, and saving to flash.
 - Ordinary (non-agent) key signatures aren't logged; only agent activity,
   key and admin changes, and logins are.
 - Refused actions cost a disk write (about as much as an approved one).
-  Someone with the PIN could use that to slow the HSM down.
+  Someone with the PIN flooding the HSM slows everyone else 6–9x (measured).
+- Someone with only the PIN can fill all 16 key slots with ordinary keys, so
+  admins can't create agent keys (found by the experiments; fix planned).
+- Anyone who can reach the HSM can release audit entries before the
+  collector copies them. This is detected (the gap shows), not prevented.
 - Deleting an agent key doesn't cancel its birth certificate everywhere.
   Shops have no way yet to learn that a key was retired ("revocation").
 - Only one admin proposal can be in progress at a time.

@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 430" width="960" height="430" role="img" aria-label="quorum-hsm under load">
+
+<style>
+  svg { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .bg { fill: #fcfcfb; }
+  .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; }
+  .grid { stroke: #e1e0d9; stroke-width: 1; }
+  .baseline { stroke: #c3c2b7; stroke-width: 1; }
+  .range { stroke: #52514e; stroke-width: 1.25; }
+  .t-h1 { fill: #0b0b0b; font-size: 20px; font-weight: 600; }
+  .t-title { fill: #0b0b0b; font-size: 14px; font-weight: 600; }
+  .t-sub, .t-legend { fill: #52514e; font-size: 12px; }
+  .t-label { fill: #0b0b0b; font-size: 12px; }
+  .t-value { fill: #0b0b0b; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .t-axis { fill: #898781; font-size: 11px; font-variant-numeric: tabular-nums; }
+  .t-note { fill: #52514e; font-size: 11px; font-style: italic; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #1a1a19; }
+    .s1 { fill: #3987e5; } .s2 { fill: #d95926; }
+    .grid { stroke: #2c2c2a; }
+    .baseline { stroke: #383835; }
+    .range { stroke: #c3c2b7; }
+    .t-h1, .t-title, .t-label, .t-value { fill: #f0efec; }
+    .t-sub, .t-legend, .t-note { fill: #c3c2b7; }
+  }
+
+  .l1 { stroke: #2a78d6; } .l2 { stroke: #eb6834; }
+  .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .dash { stroke-dasharray: 6 4; }
+  .dot { stroke: #fcfcfb; stroke-width: 2; }
+  @media (prefers-color-scheme: dark) {
+    .l1 { stroke: #3987e5; } .l2 { stroke: #d95926; }
+    .dot { stroke: #1a1a19; }
+  }
+</style>
+
+<rect class="bg" width="100%" height="100%"/>
+<text class="t-h1" x="24" y="34">quorum-hsm under load</text>
+<text class="t-sub" x="24" y="54">One emulated HSM that handles one command at a time, like a single-core chip. Every approved payment is saved to disk before it is signed.</text>
+<text class="t-title" x="24" y="88">Requests per second</text>
+<line class="grid" x1="84" y1="360.0" x2="314" y2="360.0"/>
+<text class="t-axis" x="78" y="364.0" text-anchor="end">0</text>
+<line class="grid" x1="84" y1="297.5" x2="314" y2="297.5"/>
+<text class="t-axis" x="78" y="301.5" text-anchor="end">5k</text>
+<line class="grid" x1="84" y1="235.0" x2="314" y2="235.0"/>
+<text class="t-axis" x="78" y="239.0" text-anchor="end">10k</text>
+<line class="grid" x1="84" y1="172.5" x2="314" y2="172.5"/>
+<text class="t-axis" x="78" y="176.5" text-anchor="end">15k</text>
+<line class="grid" x1="84" y1="110.0" x2="314" y2="110.0"/>
+<text class="t-axis" x="78" y="114.0" text-anchor="end">20k</text>
+<text class="t-axis" x="84.0" y="376" text-anchor="middle">1</text>
+<text class="t-axis" x="122.3" y="376" text-anchor="middle">2</text>
+<text class="t-axis" x="160.7" y="376" text-anchor="middle">4</text>
+<text class="t-axis" x="199.0" y="376" text-anchor="middle">8</text>
+<text class="t-axis" x="237.3" y="376" text-anchor="middle">16</text>
+<text class="t-axis" x="275.7" y="376" text-anchor="middle">32</text>
+<text class="t-axis" x="314.0" y="376" text-anchor="middle">64</text>
+<text class="t-axis" x="199.0" y="392" text-anchor="middle">clients sending at once</text>
+<path class="line l2" d="M84.0,239.2 L122.3,168.6 L160.7,186.4 L199.0,178.2 L237.3,172.7 L275.7,174.0 L314.0,163.3"/>
+<circle class="dot s2" cx="84.0" cy="239.2" r="4"><title>raw signing, 1 clients: 9,664/s</title></circle>
+<circle class="dot s2" cx="122.3" cy="168.6" r="4"><title>raw signing, 2 clients: 15,310/s</title></circle>
+<circle class="dot s2" cx="160.7" cy="186.4" r="4"><title>raw signing, 4 clients: 13,892/s</title></circle>
+<circle class="dot s2" cx="199.0" cy="178.2" r="4"><title>raw signing, 8 clients: 14,545/s</title></circle>
+<circle class="dot s2" cx="237.3" cy="172.7" r="4"><title>raw signing, 16 clients: 14,982/s</title></circle>
+<circle class="dot s2" cx="275.7" cy="174.0" r="4"><title>raw signing, 32 clients: 14,881/s</title></circle>
+<circle class="dot s2" cx="314.0" cy="163.3" r="4"><title>raw signing, 64 clients: 15,735/s</title></circle>
+<text class="t-label" x="324.0" y="167.3">raw signing</text>
+<path class="line l1" d="M84.0,319.0 L122.3,313.5 L160.7,321.8 L199.0,317.8 L237.3,315.7 L275.7,315.6 L314.0,316.7"/>
+<circle class="dot s1" cx="84.0" cy="319.0" r="4"><title>payments, 1 clients: 3,280/s</title></circle>
+<circle class="dot s1" cx="122.3" cy="313.5" r="4"><title>payments, 2 clients: 3,722/s</title></circle>
+<circle class="dot s1" cx="160.7" cy="321.8" r="4"><title>payments, 4 clients: 3,060/s</title></circle>
+<circle class="dot s1" cx="199.0" cy="317.8" r="4"><title>payments, 8 clients: 3,376/s</title></circle>
+<circle class="dot s1" cx="237.3" cy="315.7" r="4"><title>payments, 16 clients: 3,541/s</title></circle>
+<circle class="dot s1" cx="275.7" cy="315.6" r="4"><title>payments, 32 clients: 3,553/s</title></circle>
+<circle class="dot s1" cx="314.0" cy="316.7" r="4"><title>payments, 64 clients: 3,461/s</title></circle>
+<text class="t-label" x="324.0" y="320.7">payments</text>
+<text class="t-note" x="24" y="414">Payments level off at the disk: one save each.</text>
+<text class="t-title" x="340" y="88">Waiting time for a payment</text>
+<line class="grid" x1="400" y1="360.0" x2="600" y2="360.0"/>
+<text class="t-axis" x="394" y="364.0" text-anchor="end">0 ms</text>
+<line class="grid" x1="400" y1="297.5" x2="600" y2="297.5"/>
+<text class="t-axis" x="394" y="301.5" text-anchor="end">12 ms</text>
+<line class="grid" x1="400" y1="235.0" x2="600" y2="235.0"/>
+<text class="t-axis" x="394" y="239.0" text-anchor="end">25 ms</text>
+<line class="grid" x1="400" y1="172.5" x2="600" y2="172.5"/>
+<text class="t-axis" x="394" y="176.5" text-anchor="end">38 ms</text>
+<line class="grid" x1="400" y1="110.0" x2="600" y2="110.0"/>
+<text class="t-axis" x="394" y="114.0" text-anchor="end">50 ms</text>
+<text class="t-axis" x="400.0" y="376" text-anchor="middle">1</text>
+<text class="t-axis" x="433.3" y="376" text-anchor="middle">2</text>
+<text class="t-axis" x="466.7" y="376" text-anchor="middle">4</text>
+<text class="t-axis" x="500.0" y="376" text-anchor="middle">8</text>
+<text class="t-axis" x="533.3" y="376" text-anchor="middle">16</text>
+<text class="t-axis" x="566.7" y="376" text-anchor="middle">32</text>
+<text class="t-axis" x="600.0" y="376" text-anchor="middle">64</text>
+<text class="t-axis" x="500.0" y="392" text-anchor="middle">clients sending at once</text>
+<path class="line l1 dash" d="M400.0,356.1 L433.3,352.8 L466.7,342.1 L500.0,330.3 L533.3,302.6 L566.7,253.4 L600.0,136.8"/>
+<circle class="dot s1" cx="400.0" cy="356.1" r="4"><title>1 clients: 99% within 0.8 ms</title></circle>
+<circle class="dot s1" cx="433.3" cy="352.8" r="4"><title>2 clients: 99% within 1.4 ms</title></circle>
+<circle class="dot s1" cx="466.7" cy="342.1" r="4"><title>4 clients: 99% within 3.6 ms</title></circle>
+<circle class="dot s1" cx="500.0" cy="330.3" r="4"><title>8 clients: 99% within 5.9 ms</title></circle>
+<circle class="dot s1" cx="533.3" cy="302.6" r="4"><title>16 clients: 99% within 11.5 ms</title></circle>
+<circle class="dot s1" cx="566.7" cy="253.4" r="4"><title>32 clients: 99% within 21.3 ms</title></circle>
+<circle class="dot s1" cx="600.0" cy="136.8" r="4"><title>64 clients: 99% within 44.6 ms</title></circle>
+<text class="t-label" x="610.0" y="140.8">99th pct</text>
+<path class="line l1" d="M400.0,358.7 L433.3,357.6 L466.7,354.0 L500.0,348.8 L533.3,338.5 L566.7,317.5 L600.0,290.2"/>
+<circle class="dot s1" cx="400.0" cy="358.7" r="4"><title>1 clients: median 0.27 ms</title></circle>
+<circle class="dot s1" cx="433.3" cy="357.6" r="4"><title>2 clients: median 0.48 ms</title></circle>
+<circle class="dot s1" cx="466.7" cy="354.0" r="4"><title>4 clients: median 1.21 ms</title></circle>
+<circle class="dot s1" cx="500.0" cy="348.8" r="4"><title>8 clients: median 2.25 ms</title></circle>
+<circle class="dot s1" cx="533.3" cy="338.5" r="4"><title>16 clients: median 4.30 ms</title></circle>
+<circle class="dot s1" cx="566.7" cy="317.5" r="4"><title>32 clients: median 8.49 ms</title></circle>
+<circle class="dot s1" cx="600.0" cy="290.2" r="4"><title>64 clients: median 13.95 ms</title></circle>
+<text class="t-label" x="610.0" y="294.2">median</text>
+<text class="t-note" x="340" y="414">More clients = a longer line to wait in.</text>
+<text class="t-title" x="680" y="88">One client's median wait while others…</text>
+<text class="t-label" x="680" y="120">Nobody else (baseline)</text>
+<path class="s1" d="M680,126 h15.1 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-15.1 z"><title>Nobody else (baseline): median 238 µs</title></path>
+<text class="t-value" x="705.1" y="138">0.24 ms (1.0x)</text>
+<text class="t-label" x="680" y="156">200 idle connections</text>
+<path class="s1" d="M680,162 h19.1 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-19.1 z"><title>200 idle connections: median 289 µs</title></path>
+<text class="t-value" x="709.1" y="174">0.29 ms (1.2x)</text>
+<text class="t-label" x="680" y="192">8 flooding, no PIN</text>
+<path class="s1" d="M680,198 h20.3 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-20.3 z"><title>8 flooding, no PIN: median 304 µs</title></path>
+<text class="t-value" x="710.3" y="210">0.30 ms (1.3x)</text>
+<text class="t-label" x="680" y="228">100 half-sent requests</text>
+<path class="s1" d="M680,234 h17.0 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-17.0 z"><title>100 half-sent requests: median 262 µs</title></path>
+<text class="t-value" x="707.0" y="246">0.26 ms (1.1x)</text>
+<text class="t-label" x="680" y="264">8 sending garbage</text>
+<path class="s1" d="M680,270 h26.3 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-26.3 z"><title>8 sending garbage: median 379 µs</title></path>
+<text class="t-value" x="716.3" y="282">0.38 ms (1.6x)</text>
+<text class="t-label" x="680" y="300">8 with PIN: refused actions</text>
+<path class="s1" d="M680,306 h114.7 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-114.7 z"><title>8 with PIN: refused actions: median 1483 µs</title></path>
+<text class="t-value" x="804.7" y="318">1.48 ms (6.2x)</text>
+<text class="t-label" x="680" y="336">8 with PIN: payments</text>
+<path class="s1" d="M680,342 h176.0 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-176.0 z"><title>8 with PIN: payments: median 2248 µs</title></path>
+<text class="t-value" x="866.0" y="354">2.25 ms (9.4x)</text>
+<text class="t-note" x="680" y="414">Without the PIN, others barely slow it down.</text>
+</svg>

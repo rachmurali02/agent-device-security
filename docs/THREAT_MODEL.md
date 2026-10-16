@@ -74,6 +74,12 @@ makes a security decision.
 | T25 | Put a save in the "wrong" slot so the next save overwrites the only good copy | A4 | A save is only trusted in the slot its number belongs to | Test `a_save_in_the_wrong_slot_is_not_trusted` |
 | T26 | Confuse the board with a broken USB byte stream | A1 | Strict framing: a bad length ends the session; every frame gets exactly one well-formed reply | Tests `frames_are_reassembled…`, `oversized_frames_are_refused`; fuzz `board` |
 | T27 | Run different firmware on the board | A6 | RP2350 secure boot with your signing key (manual, permanent setup) | Not tested yet (needs the board) |
+| T28 | Spend past the budget by racing many connections at once | A1 | One command at a time; the budget is checked and charged in the same step | Lab attack 8 (exactly 10 of 100 approved); lab load test (72,116 payments, counter exact) |
+| T29 | Make the spending counter wrap around | A1 | Overflow-checked arithmetic | Lab attack 7 |
+| T30 | Lose a counter update by killing the HSM mid-traffic | A4 | Save before answering; two-slot saves | Lab crash test: 25 `kill -9`s, no uncounted signature, no reused action number |
+| T31 | Slow the HSM for everyone (denial of service) | A1, anyone | Requests without the PIN never touch the disk; half-sent requests block nobody | Lab noisy-neighbour test: 1.1–1.6x without the PIN. ⚠️ 6–9x with the PIN (not covered yet) |
+| T32 | Fill the key store so admins can't create agent keys | A1 | ❌ Not covered yet (new finding) | Lab attack 19 |
+| T33 | Delete audit entries before they are collected | anyone | Detected: the collector sees the gap and the checkpoint check fails. ⚠️ Not prevented | Lab attack 12 |
 
 ## Bugs this process found
 
@@ -84,6 +90,8 @@ makes a security decision.
 | An empty admin list got past the parser | Unit test | Milestone 3 |
 | State files with junk in a label's padding were accepted (not canonical) | **Fuzzing** (`state_load`, within seconds) | Milestone 4 |
 | A save found in the wrong slot was trusted, and the next save would then have overwritten the only good copy | Design review while moving storage to flash | Milestone 5 |
+| A PIN holder can fill the key store so admins can't create agent keys | **Experiments** (`quorum-lab`, attack 19) | Open (fix: reserve slots for agent keys) |
+| Under heavy load, the audit collector waits in the same queue as everyone, so the log fills and clients retry | **Load experiments** | Open (fix: bigger log buffer, or collector first) |
 
 ## Not covered yet
 
@@ -99,6 +107,9 @@ makes a security decision.
 - **Encrypting the state at rest** with a key unique to each device (A5).
 - **Revocation:** telling shops that a key was deleted.
 - **A PIN holder slowing the HSM down** with many refused actions (each costs
-  a disk write). Rate limits could help.
+  a disk write): measured at 6–9x. Taking turns between sessions and rate
+  limits could help.
+- **Filling the key store** (T32) and **deleting audit entries before
+  collection** (T33, detected but not prevented).
 - **A trusted clock**, so budgets could be "per day".
 - **A real secure screen** for the user's approval: the phone is simulated.

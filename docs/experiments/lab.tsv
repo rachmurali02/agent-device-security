@@ -1,0 +1,68 @@
+sweep	payment	1	3279.9	269	782	2652	1.000	0
+sweep	payment	2	3722.3	478	1437	3748	0.991	0
+sweep	payment	4	3059.6	1208	3570	7243	0.981	0
+sweep	payment	8	3376.5	2248	5933	8081	0.963	0
+sweep	payment	16	3540.7	4297	11472	15523	0.962	487
+sweep	payment	32	3553.0	8494	21312	30631	0.925	4938
+sweep	payment	64	3461.0	13954	44650	58680	0.886	8496
+sweep	refusal	1	4587.9	186	579	2521	1.000	0
+sweep	refusal	2	5838.6	306	880	2402	0.997	2
+sweep	refusal	4	5925.9	629	1532	3077	0.997	0
+sweep	refusal	8	5361.0	1396	3793	7216	0.981	3
+sweep	refusal	16	4978.5	2964	7966	20116	0.941	1398
+sweep	refusal	32	4895.1	5962	16017	30893	0.921	8125
+sweep	refusal	64	4709.9	12532	32880	47647	0.889	20065
+sweep	rawsign	1	9664.1	87	512	1236	1.000	0
+sweep	rawsign	2	15310.5	112	535	782	0.988	0
+sweep	rawsign	4	13891.8	260	890	1946	0.989	0
+sweep	rawsign	8	14545.2	506	1731	3434	0.977	0
+sweep	rawsign	16	14982.3	1016	3445	5607	0.948	0
+sweep	rawsign	32	14881.2	2108	7096	10556	0.893	0
+sweep	rawsign	64	15735.2	3987	12658	19767	0.899	0
+sweep	read	1	15088.0	54	442	803	1.000	0
+sweep	read	2	27964.8	58	464	877	0.775	0
+sweep	read	4	37699.0	89	549	929	0.819	0
+sweep	read	8	39043.4	150	913	2610	0.944	0
+sweep	read	16	41065.1	203	1924	3784	0.931	0
+sweep	read	32	41108.9	260	4028	6230	0.912	0
+sweep	read	64	39363.5	247	9140	15374	0.879	0
+noisy	none	3795.3	238	560
+noisy	refusals	647.3	1483	3431
+noisy	unauth	2898.3	304	884
+noisy	garbage	2192.3	379	1439
+noisy	idle	3103.5	289	825
+noisy	slowloris	3431.3	262	670
+noisy	payments	422.3	2248	5573
+soak	0	3889.0	2498
+soak	1	4168.2	2270
+soak	2	4292.8	2208
+soak	3	4066.8	2368
+soak	4	3756.2	2673
+soak	5	4167.8	2214
+crash	25	25	12034	12055	true
+pin_timing	0	2861
+pin_timing	1	2862
+pin_timing	2	2862
+pin_timing	3	2861
+pin_timing	4	2861
+pin_timing	5	2861
+attack	Replay the user's approval for a second, identical payment	Blocked	Blocked
+attack	Move an approval to a different recipient (same amount)	Blocked	Blocked
+attack	Use an approval for $21 on a $49 payment	Blocked	Blocked
+attack	Approve with the attacker's own "phone" key	Blocked	Blocked
+attack	Use an approval from one connection on another	Blocked	Blocked
+attack	Recipients that look like one thing but are another	Blocked	Blocked
+attack	Make the spending counter wrap around (1 cent, then the largest possible amount)	Blocked	Blocked
+attack	Race: 20 connections spend the last of a $10 budget at the same instant (100 tries of $1)	Blocked	Blocked
+attack	Reuse admins' approvals from an earlier change	Blocked	Blocked
+attack	Take approvals made for one HSM to another HSM with the same admins	Blocked	Blocked
+attack	One admin counted twice (same signature twice, or relabelled as another admin)	Blocked	Blocked
+attack	Release (delete) log entries from the HSM before the collector copies them, without the PIN	Detected	Detected
+attack	Guess the PIN, cutting the power right after every attempt to stop it being counted	Blocked	Blocked
+attack	Learn the PIN from timing (how long a wrong PIN takes, by number of correct leading digits)	Blocked	Blocked
+attack	Use another connection's login (sessions are per connection)	Blocked	Blocked
+attack	Present a payment with the wrong birth certificate (another key's, or one with old rules)	ReceiverStops	ReceiverStops
+attack	Get two payments signed for the same one-time shop request	ReceiverStops	ReceiverStops
+attack	Random garbage, a valid request with an extra byte, and a 4 GB length prefix	Blocked	Blocked
+attack	Fill the key store with ordinary keys (PIN only) so admins can't create agent keys	Works	Works
+attack	Roll back: copy the state file, spend the budget, put the old copy back	Works	Works
