@@ -28,7 +28,10 @@ jobs:
       - name: Benchmark smoke test (small run; checks the harness and attacks still work)
         run: cargo build --release -p quorum-bench && target/release/quorum-bench --iterations 50 --data /tmp/run.tsv && tools/plot_benchmarks.py /tmp/run.tsv > /dev/null
       - name: Lab smoke test (short load run, kill -9 crashes, all 20 attacks)
-        run: target/release/quorum-lab all --seconds 0.3 --max-clients 16 --soak 5 --crash-rounds 5 --out /tmp/lab.md --data /tmp/lab.tsv && tools/plot_load.py /tmp/lab.tsv > /dev/null
+        run: |
+          target/release/quorum-lab all --seconds 0.3 --max-clients 16 --soak 5 --crash-rounds 5 \
+            --out /tmp/lab.md --data /tmp/lab.tsv || { cat /tmp/lab.md; exit 1; }
+          tools/plot_load.py /tmp/lab.tsv > /dev/null
 
   firmware:
     runs-on: ubuntu-latest
