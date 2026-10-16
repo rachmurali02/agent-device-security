@@ -23,8 +23,9 @@ run yourself.
 | **A1. The computer is hacked** (the main threat) | Runs any code on the agent's computer, sees and replays everything sent to the HSM, **knows the PIN**, controls the agent. | ✅ Yes: this is what the design is for. |
 | **A2. One admin goes rogue**, or one admin's key is stolen | Signs any proposal with that one key. | ✅ Yes, as long as the threshold is 2 or more. |
 | **A3. A dishonest middleman or shop** | Replays signed actions, edits them, presents old certificates. | ✅ Yes. |
-| **A4. Physical access to the device** | Cuts the power at any moment; "glitches" the chip to flip **one** decision. | ✅ For power cuts and single glitches. ❌ Not for multiple coordinated glitches, or for reading keys out of the chip (needs real hardware, milestone 5). |
-| **A5. Someone copies the stored state** (disk image) | Reads the state file. | ❌ Not yet: the state file isn't encrypted (planned). |
+| **A4. Physical access to the device** | Cuts the power at any moment; "glitches" the chip to flip **one** decision; damages the flash. | ✅ For power cuts, single glitches and damaged flash. ❌ Not for multiple coordinated glitches, or power analysis. |
+| **A5. Someone copies the stored state** (disk image, or the Pico 2's flash chip with a clip-on programmer) | Reads the state; later writes an old copy back ("rollback"). | ❌ Not yet: the state isn't encrypted, and an old genuine copy is accepted. Planned: encrypt and authenticate it with a key in the chip's OTP, and count saves in OTP (milestone 6). |
+| **A6. Someone replaces the firmware** on the board | Installs firmware that ignores the rules. | ⚠️ Secure boot (RP2350 OTP) stops it, but turning it on is a manual, permanent step ([`HARDWARE.md`](HARDWARE.md)); not yet tried on a board. |
 
 ## Where the trust boundary is
 
@@ -67,6 +68,12 @@ makes a security decision.
 | T19 | Corrupt or tamper with the stored state | A1, A4 | State is checked strictly on load (canonical, consistent) and each save slot has a hash | Fuzz `state_load`, `slot_file`; test `corrupted_state_is_rejected` |
 | T20 | Learn the PIN from timing | A1 | Constant-time PIN comparisons | Code review (`pin_matches`, `pin_matches_again`) |
 | T21 | Slip in a malformed or weak admin or phone key | A1 | Public keys must be canonical and not small-order | Test `bad_admin_setups_are_refused_at_the_factory` |
+| T22 | Re-provision a board that's in use (new PIN, own admins) | A1 | `Provision` works only on a blank board; damaged flash makes the board refuse everything, never blank again | Tests `provisioning_survives_a_restart_and_happens_only_once`, `damaged_flash_is_refused_and_never_reprovisioned`; fuzz `board` |
+| T23 | Cut the power while the board writes flash (erase or write half-done) | A4 | Two flash slots: erase and write the older one, read it back; the hash rejects a half-done slot | Tests `a_power_cut_at_any_moment_of_a_save_keeps_a_valid_state` (every byte), `…during_provisioning…` |
+| T24 | Worn-out flash silently keeps old bytes | A4 | Every save is read back and compared; a mismatch stops the board | Test `a_save_that_does_not_read_back_correctly_stops_the_device` |
+| T25 | Put a save in the "wrong" slot so the next save overwrites the only good copy | A4 | A save is only trusted in the slot its number belongs to | Test `a_save_in_the_wrong_slot_is_not_trusted` |
+| T26 | Confuse the board with a broken USB byte stream | A1 | Strict framing: a bad length ends the session; every frame gets exactly one well-formed reply | Tests `frames_are_reassembled…`, `oversized_frames_are_refused`; fuzz `board` |
+| T27 | Run different firmware on the board | A6 | RP2350 secure boot with your signing key (manual, permanent setup) | Not tested yet (needs the board) |
 
 ## Bugs this process found
 
@@ -76,11 +83,17 @@ makes a security decision.
 | Lowering a budget below what was spent would have stopped the HSM from restarting | Code review while adding rule changes | Milestone 3 |
 | An empty admin list got past the parser | Unit test | Milestone 3 |
 | State files with junk in a label's padding were accepted (not canonical) | **Fuzzing** (`state_load`, within seconds) | Milestone 4 |
+| A save found in the wrong slot was trusted, and the next save would then have overwritten the only good copy | Design review while moving storage to flash | Milestone 5 |
 
 ## Not covered yet
 
-- **Reading keys out of the chip, and power-analysis attacks** on the signing
-  maths. These need real hardware and hardware countermeasures (milestone 5).
+- **Reading the Pico 2's flash chip** (A5): the state, keys included, is not
+  encrypted yet, and an old copy written back would be accepted (rollback).
+  Planned for milestone 6: encryption and a save counter, both anchored in
+  the RP2350's OTP memory.
+- **Power-analysis attacks** on the signing maths. These need hardware
+  countermeasures and measurement equipment.
+- **Secure boot hasn't been tried on a board yet** (A6).
 - **More than one coordinated glitch.** The double checks assume one fault per
   operation; real secure chips add glitch sensors for the rest.
 - **Encrypting the state at rest** with a key unique to each device (A5).

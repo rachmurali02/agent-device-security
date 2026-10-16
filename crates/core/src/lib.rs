@@ -14,6 +14,7 @@ pub mod cert;
 pub mod fault;
 pub mod hsm;
 pub mod keystore;
+pub mod slots;
 pub mod wire;
 
 pub use hsm::{Hsm, Provisioning, Session, Storage, StorageError};

@@ -13,6 +13,7 @@ use quorum_core::wire::{MAX_FRAME, Request, resp};
 use quorum_core::{Hsm, Session, Storage};
 use rand_core::OsRng;
 
+pub mod board;
 mod storage;
 pub use storage::{RenameStorage, SLOT_FILE_LEN, SlotStorage, latest_slot};
 
@@ -110,6 +111,7 @@ fn log(req: &[u8], out: &[u8]) {
         Ok(Request::ReadAudit { .. }) => "ReadAudit",
         Ok(Request::AuditCheckpoint) => "Checkpoint",
         Ok(Request::AckAudit { .. }) => "AckAudit",
+        Ok(Request::Provision { .. }) => "Provision",
         Err(_) => "<malformed>",
     };
     match resp::split(out) {

@@ -61,6 +61,8 @@ pub enum Cmd {
     ReadAudit = 0x40,
     AuditCheckpoint = 0x41,
     AckAudit = 0x42,
+    /// One-time setup of a blank device (real hardware only).
+    Provision = 0x50,
 }
 
 impl TryFrom<u8> for Cmd {
@@ -87,6 +89,7 @@ impl TryFrom<u8> for Cmd {
             0x40 => Cmd::ReadAudit,
             0x41 => Cmd::AuditCheckpoint,
             0x42 => Cmd::AckAudit,
+            0x50 => Cmd::Provision,
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -127,6 +130,10 @@ pub enum Status {
     NoAdminChallenge = 0x22,
     /// The audit log is full: copy it out (`ReadAudit` + `AckAudit`) first.
     AuditFull = 0x30,
+    /// A blank device: it must be provisioned first.
+    NotProvisioned = 0x50,
+    /// The device was already provisioned; that can only happen once.
+    AlreadyProvisioned = 0x51,
 }
 
 impl TryFrom<u8> for Status {
@@ -155,6 +162,8 @@ impl TryFrom<u8> for Status {
             0x21 => Status::ApprovalInvalid,
             0x22 => Status::NoAdminChallenge,
             0x30 => Status::AuditFull,
+            0x50 => Status::NotProvisioned,
+            0x51 => Status::AlreadyProvisioned,
             _ => return Err(WireError::UnknownTag),
         })
     }
@@ -346,6 +355,12 @@ pub enum Request<'a> {
     GetKeyPolicy {
         key: u32,
     },
+    /// Set up a blank device: its PIN and admins. The device picks its own
+    /// serial number and identity key. Refused once provisioned.
+    Provision {
+        pin: &'a [u8],
+        admins: AdminSet,
+    },
 }
 
 impl<'a> Request<'a> {
@@ -410,6 +425,10 @@ impl<'a> Request<'a> {
                 },
             },
             Cmd::GetKeyPolicy => Request::GetKeyPolicy { key: r.u32()? },
+            Cmd::Provision => Request::Provision {
+                pin: r.bytes(MAX_PIN)?,
+                admins: AdminSet::read(&mut r)?,
+            },
         };
         r.finish()?;
         Ok(req)
@@ -506,6 +525,11 @@ impl<'a> Request<'a> {
             Request::GetKeyPolicy { key } => {
                 w.u8(Cmd::GetKeyPolicy as u8)?;
                 w.u32(key)?;
+            }
+            Request::Provision { pin, admins } => {
+                w.u8(Cmd::Provision as u8)?;
+                w.bytes(pin)?;
+                admins.write(&mut w)?;
             }
         }
         Ok(w.len())
@@ -720,6 +744,31 @@ pub mod resp {
             };
             r.finish()?;
             Ok(id)
+        }
+    }
+
+    /// `Provision` payload: the serial number and identity key the device
+    /// chose for itself.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Provisioned {
+        pub serial: [u8; SERIAL_LEN],
+        pub public: [u8; PUBLIC_KEY_LEN],
+    }
+
+    impl Provisioned {
+        pub fn encode(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
+            w.raw(&self.serial)?;
+            w.raw(&self.public)
+        }
+
+        pub fn decode(payload: &[u8]) -> Result<Self, WireError> {
+            let mut r = Reader::new(payload);
+            let p = Provisioned {
+                serial: r.array()?,
+                public: r.array()?,
+            };
+            r.finish()?;
+            Ok(p)
         }
     }
 

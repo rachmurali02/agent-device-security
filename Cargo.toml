@@ -1,13 +1,15 @@
 [workspace]
 resolver = "3"
-# The fuzzer has its own workspace (it needs a nightly compiler).
-exclude = ["fuzz"]
+# The fuzzer (nightly compiler) and the chip firmware (cross-compiled) have
+# their own workspaces.
+exclude = ["fuzz", "firmware"]
 members = [
     "crates/core",
     "crates/emulator",
     "crates/client",
     "crates/pkcs11",
     "crates/cli", "crates/bench",
+    "crates/device",
 ]
 
 [workspace.package]
@@ -16,3 +18,13 @@ license = "Apache-2.0"
 
 [profile.release]
 panic = "abort"
+
+# Test builds: optimise the crates the power-cut tests spend their time in
+# (thousands of simulated restarts). Overflow checks and debug assertions
+# stay on.
+[profile.dev.package.quorum-core]
+opt-level = 2
+[profile.dev.package.quorum-device]
+opt-level = 2
+[profile.dev.package.sha2]
+opt-level = 2

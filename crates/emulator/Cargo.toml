@@ -8,3 +8,5 @@ description = "Runs the quorum HSM core as a local daemon over a Unix socket"
 [dependencies]
 quorum-core = { path = "../core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
+quorum-device = { path = "../device" }
+serialport = { version = "4.10.1", default-features = false }

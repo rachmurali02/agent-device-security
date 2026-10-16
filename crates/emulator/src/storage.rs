@@ -14,15 +14,10 @@ use std::io::{self, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use quorum_core::audit::digest;
-use quorum_core::hsm::STATE_MAX;
+use quorum_core::slots::{self, slot_for};
+pub use quorum_core::slots::{SLOT_LEN, latest_slot};
 use quorum_core::{Storage, StorageError};
 
-const SLOT_MAGIC: &[u8; 4] = b"QSLT";
-/// magic, sequence number, length, SHA-256 of (magic, sequence, length, state)
-const HEADER_LEN: usize = 4 + 8 + 4 + 32;
-/// Every slot has room for the largest possible state.
-pub const SLOT_LEN: usize = HEADER_LEN + STATE_MAX;
 /// The whole file: two slots. Its size never changes after creation.
 pub const SLOT_FILE_LEN: u64 = 2 * SLOT_LEN as u64;
 
@@ -93,26 +88,18 @@ impl SlotStorage {
     }
 
     /// The bytes one save writes: header plus state.
-    fn record(seq: u64, state: &[u8]) -> Vec<u8> {
-        let len = (state.len() as u32).to_le_bytes();
-        let seq_bytes = seq.to_le_bytes();
-        let hash = digest(&[SLOT_MAGIC, &seq_bytes, &len, state]);
-        let mut out = Vec::with_capacity(HEADER_LEN + state.len());
-        out.extend_from_slice(SLOT_MAGIC);
-        out.extend_from_slice(&seq_bytes);
-        out.extend_from_slice(&len);
-        out.extend_from_slice(&hash);
+    fn record(seq: u64, state: &[u8]) -> Option<Vec<u8>> {
+        let mut out = slots::header(seq, state)?.to_vec();
         out.extend_from_slice(state);
-        out
+        Some(out)
     }
 
     fn write_slot(&mut self, state: &[u8]) -> io::Result<()> {
-        if state.len() > STATE_MAX {
-            return Err(invalid("state larger than a slot".into()));
-        }
         let seq = self.seq + 1;
-        let offset = (seq % 2) * SLOT_LEN as u64;
-        self.file.write_all_at(&Self::record(seq, state), offset)?;
+        let record =
+            Self::record(seq, state).ok_or_else(|| invalid("state larger than a slot".into()))?;
+        let offset = (slot_for(seq) * SLOT_LEN) as u64;
+        self.file.write_all_at(&record, offset)?;
         if self.sync {
             // Data only: the file's size and blocks never change.
             self.file.sync_data()?;
@@ -129,31 +116,6 @@ impl Storage for SlotStorage {
             StorageError
         })
     }
-}
-
-/// Parses one slot; `None` if it is empty, torn or corrupted.
-fn parse_slot(slot: &[u8]) -> Option<(u64, &[u8])> {
-    if slot.get(..4)? != SLOT_MAGIC {
-        return None;
-    }
-    let seq = u64::from_le_bytes(slot.get(4..12)?.try_into().ok()?);
-    let len_bytes: [u8; 4] = slot.get(12..16)?.try_into().ok()?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
-    let hash = slot.get(16..HEADER_LEN)?;
-    let state = slot.get(HEADER_LEN..HEADER_LEN.checked_add(len)?)?;
-    if len > STATE_MAX || seq == 0 {
-        return None;
-    }
-    let expected = digest(&[SLOT_MAGIC, &seq.to_le_bytes(), &len_bytes, state]);
-    (hash == expected).then_some((seq, state))
-}
-
-/// The valid slot with the highest sequence number. Public so the fuzzer
-/// can feed it arbitrary file images.
-pub fn latest_slot(file: &[u8]) -> Option<(u64, &[u8])> {
-    file.chunks(SLOT_LEN)
-        .filter_map(parse_slot)
-        .max_by_key(|(seq, _)| *seq)
 }
 
 fn invalid(msg: String) -> io::Error {
@@ -211,6 +173,7 @@ impl Storage for RenameStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quorum_core::hsm::STATE_MAX;
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("quorum-slots-{}-{name}", std::process::id()));
@@ -251,7 +214,7 @@ mod tests {
         s.commit(b"first").unwrap();
         s.commit(&old).unwrap();
         let clean = fs::read(&path).unwrap();
-        let record = SlotStorage::record(3, &new);
+        let record = SlotStorage::record(3, &new).unwrap();
         // Save #3 goes to slot 3 % 2 = 1.
         let offset = SLOT_LEN;
         for cut in 0..=record.len() {
@@ -274,10 +237,10 @@ mod tests {
         s.commit(b"newer").unwrap();
         let mut image = fs::read(&path).unwrap();
         // The newest save (sequence 2) lives in slot 0.
-        image[HEADER_LEN + 2] ^= 0x01;
+        image[slots::HEADER_LEN + 2] ^= 0x01;
         assert_eq!(latest_slot(&image).unwrap().1, b"older");
         // Damage both and nothing is trusted.
-        image[SLOT_LEN + HEADER_LEN] ^= 0x01;
+        image[SLOT_LEN + slots::HEADER_LEN] ^= 0x01;
         assert!(latest_slot(&image).is_none());
     }
 

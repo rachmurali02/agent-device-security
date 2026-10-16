@@ -395,6 +395,9 @@ impl Hsm {
                 self.write_cert(key, w)
             }
 
+            // This HSM already exists; provisioning happens once.
+            Request::Provision { .. } => Err(Status::AlreadyProvisioned),
+
             Request::ChangeAdmins { admins, approvals } => {
                 require_login(session)?;
                 // Approved by the admins in charge *now*, not the new ones.

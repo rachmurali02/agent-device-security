@@ -1,0 +1,8 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# `cargo run --release` with the board in BOOTSEL mode (hold the button while
+# plugging it in) copies the firmware onto it.
+runner = "picotool load -u -v -x -t elf"
+rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Tlink.x"]

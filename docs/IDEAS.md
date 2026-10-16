@@ -54,4 +54,5 @@ Runs first on a host emulator, then on real hardware (see below).
 2. ✅ Structured agent-action parsing + per-key policy + spend/sequence counters + user confirmation
 3. ✅ Quorum for agent key create/delete, rule changes and admin changes; key birth certificates with rules versions; receiver nonces; tamper-evident audit hash chain with signed checkpoints
 4. ✅ Fuzzing (5 targets incl. stateful whole-HSM), glitch double-checks with fault injection, disk-failure tests, threat model (`docs/THREAT_MODEL.md`); bonus: two-slot storage (2.7x faster safe saves)
-5. Port trusted core to the RP2350; provisioning protocol with a secure element
+5. ✅ RP2350 (Pico 2) firmware with embassy: USB CDC transport, flash A/B storage with read-back, TRNG, one-time provisioning, LED status; host-testable `quorum-device` crate (power cut at every flash byte op), board emulator over a pseudo serial port, `board` fuzz target, UF2 build in CI, secure boot guide (`docs/HARDWARE.md`). On-board testing pending hardware.
+6. State encryption + authentication with an OTP-held key (page-locked after boot), OTP-backed anti-rollback save counter, secure boot + debug disable + glitch detector on a real board, on-board benchmarks; later: manufacturer-certified identity / attestation

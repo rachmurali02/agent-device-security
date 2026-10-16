@@ -1,0 +1,14 @@
+[package]
+name = "quorum-device"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The quorum HSM firmware logic, independent of any particular chip"
+
+[dependencies]
+quorum-core = { path = "../core" }
+rand_core = { version = "0.6", default-features = false }
+
+[dev-dependencies]
+ed25519-dalek = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }

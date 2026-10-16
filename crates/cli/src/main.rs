@@ -40,6 +40,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Set up a brand-new (blank) HSM board: its PIN and its admins. The
+    /// board picks its own serial number and identity key. This works once.
+    Provision {
+        /// The PIN for day-to-day use (4 to 32 characters).
+        #[arg(long)]
+        pin: String,
+        /// An admin's public key file (from `admin new`). Repeat for each admin.
+        #[arg(long = "admin")]
+        admins: Vec<PathBuf>,
+        /// How many admins must sign off on changes.
+        #[arg(long)]
+        threshold: Option<u8>,
+        /// Also save the board's identity public key here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Show who this HSM is: serial, identity key, admins.
     Identity {
         /// Also save the identity public key here (to give to receivers).
@@ -318,6 +334,12 @@ type Result<T> = std::result::Result<T, String>;
 
 fn run(cmd: Command) -> Result<()> {
     match cmd {
+        Command::Provision {
+            pin,
+            admins,
+            threshold,
+            out,
+        } => provision(&pin, &admins, threshold, out.as_deref()),
         Command::Identity { out } => identity(out.as_deref()),
         Command::Keys => list_keys(),
         Command::Admin(AdminCmd::New { out }) => new_key_file(&out, "admin"),
@@ -385,12 +407,15 @@ struct Hsm(Client);
 
 impl Hsm {
     fn connect() -> Result<Self> {
-        Client::connect().map(Hsm).map_err(|e| {
-            format!(
-                "Cannot reach the HSM at {} ({e}). Is quorum-emulator running?",
-                quorum_client::socket_path().display()
-            )
-        })
+        Client::connect()
+            .map(Hsm)
+            .map_err(|e| match std::env::var(quorum_client::SERIAL_ENV) {
+                Ok(dev) => format!("Cannot reach the HSM board on {dev} ({e}). Is it plugged in?"),
+                Err(_) => format!(
+                    "Cannot reach the HSM at {} ({e}). Is quorum-emulator running?",
+                    quorum_client::socket_path().display()
+                ),
+            })
     }
 
     fn call(&mut self, req: Request<'_>) -> Result<Vec<u8>> {
@@ -456,6 +481,8 @@ fn explain(s: Status) -> String {
         Status::AuditFull => {
             "the audit log is full; copy it out first with `quorum audit pull --log <file>`"
         }
+        Status::NotProvisioned => "this device is blank; set it up first with `quorum provision`",
+        Status::AlreadyProvisioned => "this device was already set up (that only happens once)",
     };
     format!("DENIED by HSM: {why}")
 }
@@ -661,6 +688,47 @@ fn with_ext(path: &Path, ext: &str) -> PathBuf {
 }
 
 // ---- commands --------------------------------------------------------------
+
+fn provision(
+    pin: &str,
+    admin_files: &[PathBuf],
+    threshold: Option<u8>,
+    out: Option<&Path>,
+) -> Result<()> {
+    let keys = admin_files
+        .iter()
+        .map(|p| read_hex_file::<32>(p))
+        .collect::<Result<Vec<_>>>()?;
+    let threshold = match threshold {
+        Some(t) => t,
+        None if keys.is_empty() => 0,
+        None => return Err("--threshold is required with --admin".into()),
+    };
+    let admins = AdminSet::new(&keys, threshold).map_err(|_| {
+        "invalid admin list: keys must be valid and different, and the threshold between 1 and the number of admins".to_string()
+    })?;
+    let mut hsm = Hsm::connect()?;
+    let payload = hsm.call(Request::Provision {
+        pin: pin.as_bytes(),
+        admins,
+    })?;
+    let p = resp::Provisioned::decode(&payload).map_err(bad_reply)?;
+    println!("provisioned HSM {}", String::from_utf8_lossy(&p.serial));
+    if keys.is_empty() {
+        println!("no admins: agent keys cannot be created on this HSM");
+    } else {
+        println!(
+            "agent keys need sign-off from {threshold} of {} admins",
+            keys.len()
+        );
+    }
+    println!("HSM identity (give this to receivers): {}", hex(&p.public));
+    if let Some(out) = out {
+        write_file(out, hex(&p.public).as_bytes())?;
+        println!("saved identity key to {}", out.display());
+    }
+    Ok(())
+}
 
 fn identity(out: Option<&Path>) -> Result<()> {
     let id = Hsm::connect()?.identity()?;

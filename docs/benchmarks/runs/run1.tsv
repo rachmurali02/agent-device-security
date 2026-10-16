@@ -1,26 +1,26 @@
-1. Signing a 64-byte message (raw signing)	No HSM: Ed25519 in the same process (floor)	17.41	40.61	54426.9
-1. Signing a 64-byte message (raw signing)	quorum-hsm core, in process (no socket)	33.60	59.92	28450.1
-1. Signing a 64-byte message (raw signing)	quorum-hsm emulator via PKCS#11	132.86	211.90	7411.1
-1. Signing a 64-byte message (raw signing)	SoftHSM2 via PKCS#11	194.19	376.17	4724.9
-2. Creating keys	quorum-hsm: general key via PKCS#11 (fsync)	618.39	1519.01	1351.4
-2. Creating keys	quorum-hsm: agent key with 2-of-3 admin sign-off + birth certificate (create + delete pair)	1884.50	2321.05	552.5
-2. Creating keys	quorum-hsm: change an agent key's rules with 2-of-3 sign-off + new certificate	1049.92	1599.49	930.0
-2. Creating keys	SoftHSM2: key via PKCS#11	11773.88	16340.44	80.6
-3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm core, in process (no socket, no disk)	85.50	140.52	11956.1
-3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm core, refusing an action (refusal recorded, no disk)	10.94	27.08	79352.9
-3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, spending saved with fsync (safe default)	294.10	931.11	3000.2
-3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, refusing an action (refusal recorded in the audit log, saved with fsync)	176.84	504.44	4905.3
-3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, fsync off (unsafe; shows cost of durability)	110.39	270.74	8236.7
-3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, previous storage (rewrite + rename, two disk waits)	762.48	2000.95	1195.8
-3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, with the user's confirmation (challenge + phone + approve)	535.65	1137.11	1714.0
-3. Approving one agent action ("pay $0.01 to shop.example")	SoftHSM2 + rules on the host, counters in memory only	205.28	385.73	4594.9
-3. Approving one agent action ("pay $0.01 to shop.example")	SoftHSM2 + rules on the host, counters saved with fsync	437.39	888.46	2067.3
-3. Approving one agent action ("pay $0.01 to shop.example")	SoftHSM2 + rules on the host, refusing an action (nothing recorded)	0.03	0.03	15479756.3
-3. Approving one agent action ("pay $0.01 to shop.example")	Receiver check: HSM identity -> certificate -> signed action	124.99	164.84	7793.6
-3. Approving one agent action ("pay $0.01 to shop.example")	Auditor check: 1,000-entry audit log against a signed checkpoint (no HSM)	227.88	369.03	4275.5
-threads	quorum-hsm emulator: raw signing via PKCS#11	8563.6	6947.6
-threads	SoftHSM2: raw signing via PKCS#11	4967.8	7917.1
-threads	quorum-hsm emulator: agent actions (fsync), one connection per thread	2660.0	3311.2
+1. Signing a 64-byte message (raw signing)	No HSM: Ed25519 in the same process (floor)	17.42	41.15	54386.5
+1. Signing a 64-byte message (raw signing)	quorum-hsm core, in process (no socket)	34.31	54.46	28097.9
+1. Signing a 64-byte message (raw signing)	quorum-hsm emulator via PKCS#11	106.03	146.89	9151.9
+1. Signing a 64-byte message (raw signing)	SoftHSM2 via PKCS#11	192.67	303.54	5033.4
+2. Creating keys	quorum-hsm: general key via PKCS#11 (fsync)	533.76	2002.94	1400.3
+2. Creating keys	quorum-hsm: agent key with 2-of-3 admin sign-off + birth certificate (create + delete pair)	1560.13	1996.75	629.2
+2. Creating keys	quorum-hsm: change an agent key's rules with 2-of-3 sign-off + new certificate	789.20	1212.28	1223.0
+2. Creating keys	SoftHSM2: key via PKCS#11	10783.58	12705.54	94.3
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm core, in process (no socket, no disk)	55.34	91.70	16727.3
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm core, refusing an action (refusal recorded, no disk)	10.96	26.41	81571.6
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, spending saved with fsync (safe default)	242.11	856.69	3446.2
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, refusing an action (refusal recorded in the audit log, saved with fsync)	193.68	561.28	4438.1
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, fsync off (unsafe; shows cost of durability)	104.64	217.52	8826.6
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, previous storage (rewrite + rename, two disk waits)	744.66	2218.40	1070.0
+3. Approving one agent action ("pay $0.01 to shop.example")	quorum-hsm emulator, with the user's confirmation (challenge + phone + approve)	573.32	1655.73	1549.3
+3. Approving one agent action ("pay $0.01 to shop.example")	SoftHSM2 + rules on the host, counters in memory only	206.99	296.96	4701.8
+3. Approving one agent action ("pay $0.01 to shop.example")	SoftHSM2 + rules on the host, counters saved with fsync	449.59	858.06	2115.2
+3. Approving one agent action ("pay $0.01 to shop.example")	SoftHSM2 + rules on the host, refusing an action (nothing recorded)	0.03	0.03	15387456.1
+3. Approving one agent action ("pay $0.01 to shop.example")	Receiver check: HSM identity -> certificate -> signed action	126.86	202.66	7432.1
+3. Approving one agent action ("pay $0.01 to shop.example")	Auditor check: 1,000-entry audit log against a signed checkpoint (no HSM)	246.23	278.96	4051.5
+threads	quorum-hsm emulator: raw signing via PKCS#11	8292.3	6375.8
+threads	SoftHSM2: raw signing via PKCS#11	5018.2	8087.8
+threads	quorum-hsm emulator: agent actions (fsync), one connection per thread	2167.2	2835.3
 attack	Get a signature for a payment the rules forbid ($9,999.99)	1	0
 attack	Spend past the budget ($3 budget, ten $1 payments)	1	0
 attack	Create a new signing key with loose rules, using only the PIN	1	0

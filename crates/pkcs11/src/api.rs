@@ -84,6 +84,9 @@ fn status_to_rv(s: Status) -> CK_RV {
         }
         // The HSM won't act until its audit log is copied out (`quorum audit pull`).
         Status::AuditFull => CKR_DEVICE_MEMORY,
+        // A blank device: set it up with `quorum provision` first.
+        Status::NotProvisioned => CKR_TOKEN_NOT_RECOGNIZED,
+        Status::AlreadyProvisioned => CKR_FUNCTION_REJECTED,
     }
 }
 

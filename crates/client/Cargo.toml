@@ -7,3 +7,6 @@ description = "Host-side connection to the quorum HSM"
 
 [dependencies]
 quorum-core = { path = "../core" }
+# Talks to the real device over USB serial. No libudev: we only open ports
+# by name, never list them.
+serialport = { version = "4.10.1", default-features = false }

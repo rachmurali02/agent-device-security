@@ -177,15 +177,21 @@ extra signatures pay for checking them twice.
 
 ### What changed since milestone 2
 
-| What | Milestone 2 | Milestone 3 | + two-slot storage | Milestone 4 (+ double checks) |
-|---|---:|---:|---:|---:|
-| Approve an agent action, saved safely | ~729 µs | ~821 µs | ~284 µs | **~242 µs** ⁴ |
-| Rule check inside the core | ~53 µs | ~55 µs | ~55 µs | ~55 µs |
-| Attacks blocked | 6 of 6 | 8 of 8 | 8 of 8 | **8 of 8** |
+| What | Milestone 2 | Milestone 3 | + two-slot storage | Milestone 4 (+ double checks) | Milestone 5 (board port) |
+|---|---:|---:|---:|---:|---:|
+| Approve an agent action, saved safely | ~729 µs | ~821 µs | ~284 µs | ~242 µs ⁴ | **~242 µs** |
+| Rule check inside the core | ~53 µs | ~55 µs | ~55 µs | ~55 µs | ~55 µs |
+| Attacks blocked | 6 of 6 | 8 of 8 | 8 of 8 | 8 of 8 | **8 of 8** |
 
 ⁴ Lower than the column before it because the disk was faster in this run
 (the old-storage row on the same disk also dropped ~10%), not because of
 the code.
+
+Milestone 5 moved the save-slot format into the core (so the emulator and
+the board share it) and added the board firmware; the emulator's numbers
+didn't change. Speed on the board itself will be measured once it arrives:
+signing on a 150 MHz microcontroller and erasing flash will be much slower
+than on a PC.
 
 The audit log added about 10–15% to each action. Two-slot storage then took
 away nearly two-thirds of the total. (The machine was restarted between some
@@ -205,7 +211,7 @@ knowledge; check the vendor's documentation before relying on them.
 | TPM 2.0 chips | Usually not | Partly: built-in policies (require another signature, counters) | Could do "user must approve", but can't read a payment amount |
 | Secure elements (e.g. ATECC608) | Usually not (P-256) | No, fixed functions | Good for storing a device's identity key, not for rules |
 | ARM TrustZone (e.g. OP-TEE) | Yes, in software | **Yes**, as a trusted app | Our core can be ported (on the roadmap) |
-| Secure microcontroller (e.g. Raspberry Pi RP2350) | Yes, in software | **Yes** | Our core already builds for it (milestone 5) |
+| Secure microcontroller (e.g. Raspberry Pi RP2350) | Yes, in software | **Yes** | Our firmware for it is built (milestone 5, [`HARDWARE.md`](HARDWARE.md)); speed to be measured on the board |
 
 Our benchmark tool works with anything that speaks PKCS#11. Running it on
 real hardware is the way to fill in the speed column for these.

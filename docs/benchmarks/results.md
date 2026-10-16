@@ -9,44 +9,44 @@
 
 | Option | Median latency | 99th percentile | Ops per second |
 |---|---:|---:|---:|
-| No HSM: Ed25519 in the same process (floor) | 17.4 µs | 40.6 µs | 54427 |
-| quorum-hsm core, in process (no socket) | 33.6 µs | 59.9 µs | 28450 |
-| quorum-hsm emulator via PKCS#11 | 132.9 µs | 211.9 µs | 7411 |
-| SoftHSM2 via PKCS#11 | 194.2 µs | 376.2 µs | 4725 |
+| No HSM: Ed25519 in the same process (floor) | 17.4 µs | 41.1 µs | 54386 |
+| quorum-hsm core, in process (no socket) | 34.3 µs | 54.5 µs | 28098 |
+| quorum-hsm emulator via PKCS#11 | 106.0 µs | 146.9 µs | 9152 |
+| SoftHSM2 via PKCS#11 | 192.7 µs | 303.5 µs | 5033 |
 
 ### 2. Creating keys
 
 | Option | Median latency | 99th percentile | Ops per second |
 |---|---:|---:|---:|
-| quorum-hsm: general key via PKCS#11 (fsync) | 618.4 µs | 1.52 ms | 1351 |
-| quorum-hsm: agent key with 2-of-3 admin sign-off + birth certificate (create + delete pair) | 1.88 ms | 2.32 ms | 553 |
-| quorum-hsm: change an agent key's rules with 2-of-3 sign-off + new certificate | 1.05 ms | 1.60 ms | 930 |
-| SoftHSM2: key via PKCS#11 | 11.77 ms | 16.34 ms | 81 |
+| quorum-hsm: general key via PKCS#11 (fsync) | 533.8 µs | 2.00 ms | 1400 |
+| quorum-hsm: agent key with 2-of-3 admin sign-off + birth certificate (create + delete pair) | 1.56 ms | 2.00 ms | 629 |
+| quorum-hsm: change an agent key's rules with 2-of-3 sign-off + new certificate | 789.2 µs | 1.21 ms | 1223 |
+| SoftHSM2: key via PKCS#11 | 10.78 ms | 12.71 ms | 94 |
 
 ### 3. Approving one agent action ("pay $0.01 to shop.example")
 
 | Option | Median latency | 99th percentile | Ops per second |
 |---|---:|---:|---:|
-| quorum-hsm core, in process (no socket, no disk) | 85.5 µs | 140.5 µs | 11956 |
-| quorum-hsm core, refusing an action (refusal recorded, no disk) | 10.9 µs | 27.1 µs | 79353 |
-| quorum-hsm emulator, spending saved with fsync (safe default) | 294.1 µs | 931.1 µs | 3000 |
-| quorum-hsm emulator, refusing an action (refusal recorded in the audit log, saved with fsync) | 176.8 µs | 504.4 µs | 4905 |
-| quorum-hsm emulator, fsync off (unsafe; shows cost of durability) | 110.4 µs | 270.7 µs | 8237 |
-| quorum-hsm emulator, previous storage (rewrite + rename, two disk waits) | 762.5 µs | 2.00 ms | 1196 |
-| quorum-hsm emulator, with the user's confirmation (challenge + phone + approve) | 535.6 µs | 1.14 ms | 1714 |
-| SoftHSM2 + rules on the host, counters in memory only | 205.3 µs | 385.7 µs | 4595 |
-| SoftHSM2 + rules on the host, counters saved with fsync | 437.4 µs | 888.5 µs | 2067 |
-| SoftHSM2 + rules on the host, refusing an action (nothing recorded) | 0.0 µs | 0.0 µs | 15479756 |
-| Receiver check: HSM identity -> certificate -> signed action | 125.0 µs | 164.8 µs | 7794 |
-| Auditor check: 1,000-entry audit log against a signed checkpoint (no HSM) | 227.9 µs | 369.0 µs | 4276 |
+| quorum-hsm core, in process (no socket, no disk) | 55.3 µs | 91.7 µs | 16727 |
+| quorum-hsm core, refusing an action (refusal recorded, no disk) | 11.0 µs | 26.4 µs | 81572 |
+| quorum-hsm emulator, spending saved with fsync (safe default) | 242.1 µs | 856.7 µs | 3446 |
+| quorum-hsm emulator, refusing an action (refusal recorded in the audit log, saved with fsync) | 193.7 µs | 561.3 µs | 4438 |
+| quorum-hsm emulator, fsync off (unsafe; shows cost of durability) | 104.6 µs | 217.5 µs | 8827 |
+| quorum-hsm emulator, previous storage (rewrite + rename, two disk waits) | 744.7 µs | 2.22 ms | 1070 |
+| quorum-hsm emulator, with the user's confirmation (challenge + phone + approve) | 573.3 µs | 1.66 ms | 1549 |
+| SoftHSM2 + rules on the host, counters in memory only | 207.0 µs | 297.0 µs | 4702 |
+| SoftHSM2 + rules on the host, counters saved with fsync | 449.6 µs | 858.1 µs | 2115 |
+| SoftHSM2 + rules on the host, refusing an action (nothing recorded) | 0.0 µs | 0.0 µs | 15387456 |
+| Receiver check: HSM identity -> certificate -> signed action | 126.9 µs | 202.7 µs | 7432 |
+| Auditor check: 1,000-entry audit log against a signed checkpoint (no HSM) | 246.2 µs | 279.0 µs | 4051 |
 
 ### 4. Many requests at once (4 threads)
 
 | Option | Ops per second, 1 thread | Ops per second, 4 threads |
 |---|---:|---:|
-| quorum-hsm emulator: raw signing via PKCS#11 | 8564 | 6948 |
-| SoftHSM2: raw signing via PKCS#11 | 4968 | 7917 |
-| quorum-hsm emulator: agent actions (fsync), one connection per thread | 2660 | 3311 |
+| quorum-hsm emulator: raw signing via PKCS#11 | 8292 | 6376 |
+| SoftHSM2: raw signing via PKCS#11 | 5018 | 8088 |
+| quorum-hsm emulator: agent actions (fsync), one connection per thread | 2167 | 2835 |
 
 ### 5. Security: attacks by someone who controls the computer and knows the PIN
 

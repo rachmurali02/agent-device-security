@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECONDS_EACH=${1:-60}
 NIGHTLY=${NIGHTLY:-nightly-2026-10-14}
-for t in wire_request state_load verifiers slot_file hsm_commands; do
+for t in wire_request state_load verifiers slot_file board hsm_commands; do
   echo "== $t ($SECONDS_EACH s)" >&2
   extra=()
   [ "$t" = hsm_commands ] && extra=(-max_len=2048)

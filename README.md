@@ -2,6 +2,8 @@
 
 **A security chip, written in Rust, that guards the secret keys an AI agent uses, and that can't be tricked into misusing them.**
 
+It runs on a $5 Raspberry Pi Pico 2 board, or in an emulator on your computer.
+
 ## The idea in one minute
 
 When an AI agent on your phone or laptop does something important (sends an
@@ -34,6 +36,34 @@ safely saved agent action takes about a quarter of a millisecond. Details in
 
 ## What works today
 
+### Milestone 5: on a real chip ✅ (waiting for the board)
+
+- **Firmware for the Raspberry Pi Pico 2** (RP2350 chip). The board plugs
+  into USB and shows up as a serial port. The `quorum` tool talks to it
+  exactly as it talks to the emulator: set `QUORUM_HSM_SERIAL=/dev/ttyACM0`.
+  The same core makes every decision; the chip-specific part only moves
+  bytes (USB, flash, random numbers, the LED).
+- **A new board starts blank.** `quorum provision` sets its PIN and admins
+  once; the board picks its own serial number and identity key with the
+  chip's hardware random number generator. After that, provisioning is
+  refused for good, so nobody can swap in their own admins. Damaged flash
+  makes the board refuse everything rather than go blank again.
+- **Saving on real flash memory.** Flash must be erased before it's written,
+  so a save erases the older of two slots, writes it, and **reads it back**
+  to check. A test cuts the power after **every single byte** of erasing and
+  writing (thousands of cuts): the board always restarts with a valid state,
+  and never forgets something it said yes to.
+- **Try the board without the board.** `quorum-emulator board` runs the real
+  firmware logic on a simulated flash chip, behind a pseudo serial port:
+  `./scripts/demo-board.sh` goes from blank to provisioned to in use, then
+  "unplugs" the board and shows that the key and its spending survived.
+- **Secure boot instructions** (only run firmware signed with your key),
+  with clear warnings, since it burns the chip's one-time memory and can't be
+  undone. Everything is in [`docs/HARDWARE.md`](docs/HARDWARE.md): what to
+  buy, how to flash it, and what a Pico 2 doesn't protect yet.
+- The firmware is built on every push, and GitHub Actions publishes a
+  ready-to-flash `.uf2` file (copy it onto the board like onto a USB stick).
+
 ### Milestone 4: attacking it on purpose ✅
 
 - **Glitch resistance.** Attackers with the device in hand can disturb a
@@ -58,7 +88,7 @@ safely saved agent action takes about a quarter of a millisecond. Details in
   hidden in a label's padding was accepted. It's fixed, and that input is
   kept as a permanent test.
 - **A threat model** ([`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)): what
-  we protect, from whom, the 21 threats we handle, the test that proves each
+  we protect, from whom, the threats we handle, the test that proves each
   one, and what isn't covered yet.
 
 ### Milestone 3: changing things safely, and a record nobody can quietly edit ✅
@@ -183,7 +213,9 @@ You need [Rust](https://rustup.rs), `pkcs11-tool` and `openssl`
 
 ```bash
 ./scripts/demo-agent.sh  # an AI shopping agent: admins, rules, shops, attacks
+./scripts/demo-board.sh  # a brand-new board: provision it, use it, unplug it
 ./scripts/demo.sh        # the basics: keys, PIN and signing
+./scripts/firmware.sh    # build the Pico 2 firmware (see docs/HARDWARE.md)
 ./scripts/bench.sh       # speed and attack comparison with SoftHSM2
 cargo test --workspace   # run all the tests
 ```
@@ -220,6 +252,12 @@ Then it plays this out:
 | the log is checked against an HSM-signed checkpoint | ✅ complete and unaltered |
 | someone erases the amount of the refused $80 attempt in the log | ❌ detected |
 | someone deletes that entry instead | ❌ detected |
+
+**The board demo** plugs in a simulated brand-new board: it refuses to do
+anything until it's provisioned, and refuses to be provisioned a second
+time. Two admins create an agent key with a $30 budget, the agent spends
+$20, and the board is unplugged and plugged back in. The key, its rules and
+the $20 are still there, so $15 more is refused and $10 is approved.
 
 **The basics demo** creates an HSM, makes a key, signs a message, checks the
 signature with OpenSSL, shows that a changed message fails, and shows a wrong
@@ -284,13 +322,14 @@ $Q audit show --log audit.log
 
 | Kind | What it proves | Run it |
 |---|---|---|
-| Unit and scenario tests (80) | Every rule, refusal and attack scenario behaves as designed | `cargo test --workspace` |
+| Unit and scenario tests (94) | Every rule, refusal and attack scenario behaves as designed | `cargo test --workspace` |
 | Glitch tests (6 more) | Flipping any one security decision never yields a signature, login or key | `cargo test -p quorum-core --features fault-injection` |
 | Disk-failure test | Failing the disk at every possible save never yields an unsaved signature | (part of the unit tests) |
-| Power-cut test | A save cut off at any byte leaves the previous state intact | (part of the unit tests) |
-| Fuzzing (5 targets) | Millions of random inputs: no crashes, one encoding per message, rules always hold | `./scripts/fuzz.sh 60` |
+| Power-cut tests | A save cut off at any byte leaves the previous state intact, on disk and on (simulated) flash, including mid-erase | (part of the unit tests) |
+| Fuzzing (6 targets) | Millions of random inputs: no crashes, one encoding per message, rules always hold; a board booting from any flash contents | `./scripts/fuzz.sh 60` |
 | Benchmark attacks (8) | Real attacks against our HSM and SoftHSM2; fails if any gets through ours | `./scripts/bench.sh` |
-| Demos | The full stories, end to end, with real tools (`pkcs11-tool`, OpenSSL) | `./scripts/demo-agent.sh` |
+| Demos | The full stories, end to end, with real tools (`pkcs11-tool`, OpenSSL) and a simulated board over a serial port | `./scripts/demo-agent.sh`, `./scripts/demo-board.sh` |
+| Firmware build | The Pico 2 firmware compiles, passes the linter, and converts to `.uf2` | `./scripts/firmware.sh` |
 
 All of these run on every push in GitHub Actions.
 
@@ -299,26 +338,36 @@ All of these run on every push in GitHub Actions.
 ```
  Any program               Adapter                    The "chip"
  (pkcs11-tool,   ──────►   quorum-pkcs11   ──┐
-  OpenSSL, …)    PKCS#11   translates only   │
-                                             ├─►  quorum-emulator
- AI agent        ──────►   quorum (CLI)    ──┘     └─ quorum-core
- user's phone              asks, shows,   socket      makes every decision:
- verifier                  checks                     keys, PIN, signing,
-                                                      agent rules
+  OpenSSL, …)    PKCS#11   translates only   │   socket
+                                             ├─────────►  quorum-emulator
+ AI agent        ──────►   quorum (CLI)    ──┘                └─ quorum-core
+ user's phone              asks, shows,      │   USB serial
+ verifier                  checks            └─────────►  Pico 2 board (firmware/rp2350)
+                                                              └─ quorum-device
+                                                                  └─ quorum-core
 ```
+
+`quorum-core` makes every decision (keys, PIN, signing, agent rules, admins,
+audit log) and is the same code in both places. `quorum-device` adds what a
+real board needs: starting blank, provisioning, and saving to flash.
 
 | Folder | What it is | Plain-English role |
 |---|---|---|
 | `crates/core` | `quorum-core` | The brain of the HSM. All security decisions happen here. |
-| `crates/emulator` | `quorum-emulator` | Pretends to be the chip, so we can develop on a normal computer. |
+| `crates/device` | `quorum-device` | The board's firmware logic: blank → provisioned → ready, saving to flash. Tested with a simulated flash chip. |
+| `firmware/rp2350` | Pico 2 firmware | Connects the above to the RP2350 chip: USB, flash, random numbers, LED. |
+| `crates/emulator` | `quorum-emulator` | Pretends to be the chip (or a whole board), so we can develop on a normal computer. |
 | `crates/pkcs11` | `quorum-pkcs11` | The adapter that lets standard tools talk to our HSM. |
 | `crates/cli` | `quorum` | The command-line tool: admins, agent actions, shops, the audit log. |
 | `crates/client` | `quorum-client` | The small piece that connects programs to the HSM. |
 | `crates/bench` | `quorum-bench` | Measures speed and runs attacks, against our HSM and SoftHSM2. |
 | `fuzz/` | Fuzz targets | Random-input testing (needs a nightly compiler). |
 | `scripts/demo-agent.sh` | Demo | The AI-agent story with one command. |
+| `scripts/demo-board.sh` | Demo | A brand-new board's life, with a simulated board. |
 | `scripts/demo.sh` | Demo | The basics with one command. |
-| `tools/` | Helpers | A code generator for the adapter, and the chart drawer. |
+| `scripts/firmware.sh` | Build | Builds the Pico 2 firmware (`.elf` and `.uf2`). |
+| `tools/` | Helpers | A code generator for the adapter, the chart drawer, and the `.uf2` converter. |
+| `docs/HARDWARE.md` | Guide | Buying, flashing and provisioning a Pico 2; secure boot. |
 | `docs/BENCHMARKS.md` | Report | Benchmark results and what they mean. |
 | `docs/THREAT_MODEL.md` | Report | What we protect, from whom, and how we know it works. |
 | `docs/IDEAS.md` | Roadmap | Where the project is going. |
@@ -352,17 +401,22 @@ All of these run on every push in GitHub Actions.
 | **Only logged-in users' actions are logged**, and failed PINs are capped at 5. | Someone without the PIN can't flood the log to stop the HSM. |
 | **Admin changes need the *current* admins.** The list can never be emptied. | Nobody can appoint themselves, and there's always someone who can approve changes. |
 | **Shops' one-time codes must be 16+ random bytes**, and the user's approval covers the code and expiry too. | Codes can't be guessed, and an agent can't stretch the deadline after the user said yes. |
+| **A board can be provisioned only once**, and damaged flash makes it refuse everything instead of going blank. | Nobody can reset a board to install their own PIN and admins, or use damage to reset its counters. |
+| **The board reads back every save** and stops if it doesn't match. | Worn-out flash can't silently lose a counter update. |
+| **A save is only trusted in the slot its number belongs to.** | The next save can never overwrite the only good copy. Found by design review while porting to flash. |
 | **Public keys from outside are checked strictly.** The test suite caught that the signature library accepts some malformed keys, so we added our own check. | A malformed or "weak" admin or phone key can't slip in. |
 
 ## Not done yet (honest limitations)
 
-- The emulator is software pretending to be hardware. It is **not** real
-  hardware protection yet: no protection against reading keys out of the
-  chip, or against power-analysis attacks.
+- **The board firmware hasn't run on a physical board yet** (it's built and
+  its logic is tested in emulation). Secure boot is documented, not tried.
+- **A Pico 2 is not tamper-proof yet.** Its flash is a separate chip on the
+  board: someone holding it can read the state (keys included, not encrypted
+  yet) or write an old copy back to undo spending. The planned fix is to
+  encrypt the state with a key in the chip's one-time memory and to count
+  saves there (milestone 6). No protection against power-analysis attacks.
 - The double checks handle **one** glitch per operation; several coordinated
   glitches need hardware sensors.
-- The HSM's saved state file (keys and PIN) is **not encrypted** yet. Encrypting
-  it with a key unique to each device is on the roadmap.
 - The audit log makes deletion *detectable*, not impossible. If the only
   copy of the log is destroyed, the evidence is gone; keep copies somewhere
   the agent's computer can't reach.
@@ -389,7 +443,8 @@ All of these run on every push in GitHub Actions.
 | 2 | Rules inside the HSM for agent actions (limits, budget, user confirmation) | ✅ Done |
 | 3 | Sign-off from several admins for key creation, deletion, rule changes and admin changes; birth certificates; tamper-evident audit log | ✅ Done |
 | 4 | Fuzzing, glitch (fault-injection) tests, disk-failure tests, threat model | ✅ Done |
-| 5 | **Run on a real chip (Raspberry Pi RP2350) with secure boot** | Next |
+| 5 | Run on a real chip (Raspberry Pi Pico 2): firmware, provisioning, flash storage, secure boot guide | ✅ Built and tested in emulation; on-board testing when the board arrives |
+| 6 | **On the board: encrypted, rollback-proof state (keys in OTP), measured speed** | Next |
 
 More detail in [`docs/IDEAS.md`](docs/IDEAS.md).
 
@@ -464,3 +519,12 @@ secure microcontroller, or a commercial HSM with a firmware SDK.
 - **Glitch / fault injection**: disturbing a chip so it makes one wrong decision; in tests, we flip decisions on purpose.
 - **Fuzzing**: feeding a program huge numbers of random or mutated inputs to find crashes and broken rules.
 - **Threat model**: a list of what we protect, from whom, and how.
+- **Pico 2 / RP2350**: a $5 Raspberry Pi board and the chip on it, with security features such as secure boot.
+- **Firmware**: the program that runs on the chip itself.
+- **Flash memory**: where the board keeps data when it's off. It must be erased before it can be rewritten.
+- **Provisioning**: the one-time setup of a new device (its PIN, its admins, its identity key).
+- **Serial port**: a simple byte-by-byte connection; the board shows up as one over USB.
+- **UF2**: the file format you copy onto the board, like onto a USB stick, to install firmware.
+- **OTP (one-time programmable) memory**: bits in the chip that can be set once and never cleared.
+- **Secure boot**: the chip only runs firmware signed with your key.
+- **Rollback**: putting an old copy of the saved state back, to undo changes.

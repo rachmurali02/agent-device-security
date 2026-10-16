@@ -4,6 +4,7 @@
 //!   quorum-emulator init  --state <file> --pin <pin>
 //!                         [--admin <pubkey file>]... [--threshold <n>] [--force]
 //!   quorum-emulator serve --state <file> --socket <path> [--no-fsync]
+//!   quorum-emulator board --flash <file> (--socket <path> | --pty)
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("init") => init(&args[1..]),
         Some("serve") => serve(&args[1..]),
+        Some("board") => board(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -36,7 +38,10 @@ fn main() -> ExitCode {
 const USAGE: &str = "usage:
   quorum-emulator init  --state <file> --pin <pin>
                         [--admin <pubkey file>]... [--threshold <n>] [--force]
-  quorum-emulator serve --state <file> --socket <path> [--no-fsync]";
+  quorum-emulator serve --state <file> --socket <path> [--no-fsync]
+  quorum-emulator board --flash <file> (--socket <path> | --pty)
+      a whole board (the real firmware logic on simulated flash); it starts
+      blank: set it up with `quorum provision`";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -180,5 +185,31 @@ fn serve(args: &[String]) -> Result<(), String> {
         );
     }
     quorum_emulator::serve(listener, Device { hsm, storage });
+    Ok(())
+}
+
+/// Emulates a whole board: blank at first, set up with `quorum provision`.
+fn board(args: &[String]) -> Result<(), String> {
+    use quorum_emulator::board;
+    let flash = PathBuf::from(required(args, "--flash")?);
+    let mut board = board::boot(&flash).map_err(|e| format!("opening {}: {e}", flash.display()))?;
+    eprintln!("board flash {} ({})", flash.display(), board.mode());
+    if args.iter().any(|a| a == "--pty") {
+        return board::serve_pty(&mut board, |name| {
+            // stdout, so scripts can read it: QUORUM_HSM_SERIAL=<this>
+            println!("{name}");
+            eprintln!("board listening on serial port {name}");
+        })
+        .map_err(|e| format!("serial port: {e}"));
+    }
+    let socket = PathBuf::from(required(args, "--socket")?);
+    if socket.exists() {
+        fs::remove_file(&socket).map_err(|e| format!("removing stale socket: {e}"))?;
+    }
+    let listener = UnixListener::bind(&socket).map_err(|e| format!("bind: {e}"))?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod socket: {e}"))?;
+    eprintln!("board listening on {}", socket.display());
+    board::serve_socket(listener, &mut board);
     Ok(())
 }
