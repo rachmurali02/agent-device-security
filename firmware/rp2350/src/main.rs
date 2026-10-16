@@ -1,4 +1,5 @@
-//! The quorum HSM on a Raspberry Pi Pico 2 (RP2350).
+//! The quorum HSM on an RP2350 board: the Raspberry Pi Pico 2 (default) or
+//! the Seeed Studio XIAO RP2350 (`--features xiao-rp2350`).
 //!
 //! This file only connects the chip to the HSM logic, which lives in the
 //! `quorum-device` and `quorum-core` crates (tested on the computer):
@@ -8,7 +9,7 @@
 //!   Opening the port starts a session; closing it logs out.
 //! - **Flash**: the last 64 KB of the 4 MB flash chip hold the HSM's state
 //!   (two slots, see `quorum_device::flash`). The program cannot overlap it
-//!   (memory.x).
+//!   (memory.x.in).
 //! - **Random numbers** come from the RP2350's hardware random number
 //!   generator (TRNG): key generation, challenges, the serial number.
 //! - **The LED** shows the device's mode: slow blink = blank (waiting for
@@ -47,8 +48,21 @@ bind_interrupts!(struct Irqs {
     TRNG_IRQ => trng::InterruptHandler<TRNG>;
 });
 
-/// The Pico 2's flash chip.
+/// The board's flash chip: 4 MB on the Pico 2, 2 MB on the XIAO RP2350.
+#[cfg(not(feature = "xiao-rp2350"))]
 const FLASH_SIZE: usize = 4 * 1024 * 1024;
+#[cfg(feature = "xiao-rp2350")]
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
+/// Both boards have a user LED on GPIO 25. The XIAO's lights up when the pin
+/// is low.
+#[cfg(not(feature = "xiao-rp2350"))]
+const LED_ON: Level = Level::High;
+#[cfg(not(feature = "xiao-rp2350"))]
+const LED_OFF: Level = Level::Low;
+#[cfg(feature = "xiao-rp2350")]
+const LED_ON: Level = Level::Low;
+#[cfg(feature = "xiao-rp2350")]
+const LED_OFF: Level = Level::High;
 /// Where the state area starts: the last 64 KB, which memory.x keeps free.
 const STATE_BASE: u32 = (FLASH_SIZE - 64 * 1024) as u32;
 const _: () = assert!(region_len(4096) <= 64 * 1024);
@@ -113,7 +127,7 @@ async fn main(_spawner: Spawner) {
     // meant for devices that are not sold.
     let mut config = Config::new(0x1209, 0x0001);
     config.manufacturer = Some("quorum-hsm");
-    config.product = Some("quorum HSM (Pico 2)");
+    config.product = Some("quorum HSM (RP2350)");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 
@@ -205,13 +219,13 @@ async fn write_all(
     Ok(())
 }
 
-/// The Pico 2's on-board LED (GPIO 25) shows the mode.
+/// The on-board LED (GPIO 25) shows the mode.
 async fn led(pin: Peri<'static, embassy_rp::peripherals::PIN_25>) {
-    let mut led = Output::new(pin, Level::Low);
+    let mut led = Output::new(pin, LED_OFF);
     loop {
         match MODE.load(Ordering::Relaxed) {
             READY => {
-                led.set_high();
+                led.set_level(LED_ON);
                 Timer::after_millis(200).await;
             }
             BLANK => {

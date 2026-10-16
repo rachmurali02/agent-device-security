@@ -1,9 +1,10 @@
-/* Raspberry Pi Pico 2 (RP2350, 4 MB flash, 520 KB RAM).
+/* RP2350 boards (520 KB RAM). build.rs fills in the flash size: 4 MB on
+ * the Raspberry Pi Pico 2, 2 MB on the Seeed XIAO RP2350.
  *
  * The last 64 KB of flash are kept out of the program: the HSM's state lives
- * there (two 8 KB slots at 0x3F0000; see src/main.rs, STATE_BASE). */
+ * there (two 8 KB slots; see src/main.rs, STATE_BASE). */
 MEMORY {
-    FLASH : ORIGIN = 0x10000000, LENGTH = 4096K - 64K
+    FLASH : ORIGIN = 0x10000000, LENGTH = @FLASH_KB@K - 64K
     RAM   : ORIGIN = 0x20000000, LENGTH = 512K
     SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
     SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K

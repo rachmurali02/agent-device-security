@@ -2,7 +2,7 @@
 
 **A security chip, written in Rust, that guards the secret keys an AI agent uses, and that can't be tricked into misusing them.**
 
-It runs on a $5 Raspberry Pi Pico 2 board, or in an emulator on your computer.
+It runs on a $5 RP2350 board (Raspberry Pi Pico 2 or Seeed XIAO RP2350), or in an emulator on your computer.
 
 ## The idea in one minute
 
@@ -38,7 +38,8 @@ safely saved agent action takes about a quarter of a millisecond. Details in
 
 ### Milestone 5: on a real chip ✅ (waiting for the board)
 
-- **Firmware for the Raspberry Pi Pico 2** (RP2350 chip). The board plugs
+- **Firmware for RP2350 boards**: the Raspberry Pi Pico 2 and the Seeed
+  Studio XIAO RP2350, one firmware file each. The board plugs
   into USB and shows up as a serial port. The `quorum` tool talks to it
   exactly as it talks to the emulator: set `QUORUM_HSM_SERIAL=/dev/ttyACM0`.
   The same core makes every decision; the chip-specific part only moves
@@ -215,7 +216,7 @@ You need [Rust](https://rustup.rs), `pkcs11-tool` and `openssl`
 ./scripts/demo-agent.sh  # an AI shopping agent: admins, rules, shops, attacks
 ./scripts/demo-board.sh  # a brand-new board: provision it, use it, unplug it
 ./scripts/demo.sh        # the basics: keys, PIN and signing
-./scripts/firmware.sh    # build the Pico 2 firmware (see docs/HARDWARE.md)
+./scripts/firmware.sh    # build the board firmware (see docs/HARDWARE.md)
 ./scripts/bench.sh       # speed and attack comparison with SoftHSM2
 cargo test --workspace   # run all the tests
 ```
@@ -329,7 +330,7 @@ $Q audit show --log audit.log
 | Fuzzing (6 targets) | Millions of random inputs: no crashes, one encoding per message, rules always hold; a board booting from any flash contents | `./scripts/fuzz.sh 60` |
 | Benchmark attacks (8) | Real attacks against our HSM and SoftHSM2; fails if any gets through ours | `./scripts/bench.sh` |
 | Demos | The full stories, end to end, with real tools (`pkcs11-tool`, OpenSSL) and a simulated board over a serial port | `./scripts/demo-agent.sh`, `./scripts/demo-board.sh` |
-| Firmware build | The Pico 2 firmware compiles, passes the linter, and converts to `.uf2` | `./scripts/firmware.sh` |
+| Firmware build | The firmware for both boards compiles, passes the linter, and converts to `.uf2` | `./scripts/firmware.sh` |
 
 All of these run on every push in GitHub Actions.
 
@@ -342,7 +343,7 @@ All of these run on every push in GitHub Actions.
                                              ├─────────►  quorum-emulator
  AI agent        ──────►   quorum (CLI)    ──┘                └─ quorum-core
  user's phone              asks, shows,      │   USB serial
- verifier                  checks            └─────────►  Pico 2 board (firmware/rp2350)
+ verifier                  checks            └─────────►  RP2350 board (firmware/rp2350)
                                                               └─ quorum-device
                                                                   └─ quorum-core
 ```
@@ -355,7 +356,7 @@ real board needs: starting blank, provisioning, and saving to flash.
 |---|---|---|
 | `crates/core` | `quorum-core` | The brain of the HSM. All security decisions happen here. |
 | `crates/device` | `quorum-device` | The board's firmware logic: blank → provisioned → ready, saving to flash. Tested with a simulated flash chip. |
-| `firmware/rp2350` | Pico 2 firmware | Connects the above to the RP2350 chip: USB, flash, random numbers, LED. |
+| `firmware/rp2350` | Board firmware | Connects the above to the RP2350 chip: USB, flash, random numbers, LED. |
 | `crates/emulator` | `quorum-emulator` | Pretends to be the chip (or a whole board), so we can develop on a normal computer. |
 | `crates/pkcs11` | `quorum-pkcs11` | The adapter that lets standard tools talk to our HSM. |
 | `crates/cli` | `quorum` | The command-line tool: admins, agent actions, shops, the audit log. |
@@ -365,9 +366,9 @@ real board needs: starting blank, provisioning, and saving to flash.
 | `scripts/demo-agent.sh` | Demo | The AI-agent story with one command. |
 | `scripts/demo-board.sh` | Demo | A brand-new board's life, with a simulated board. |
 | `scripts/demo.sh` | Demo | The basics with one command. |
-| `scripts/firmware.sh` | Build | Builds the Pico 2 firmware (`.elf` and `.uf2`). |
+| `scripts/firmware.sh` | Build | Builds the board firmware (`.elf` and `.uf2`, one per board). |
 | `tools/` | Helpers | A code generator for the adapter, the chart drawer, and the `.uf2` converter. |
-| `docs/HARDWARE.md` | Guide | Buying, flashing and provisioning a Pico 2; secure boot. |
+| `docs/HARDWARE.md` | Guide | Buying, flashing and provisioning a board; what to test on it; secure boot. |
 | `docs/BENCHMARKS.md` | Report | Benchmark results and what they mean. |
 | `docs/THREAT_MODEL.md` | Report | What we protect, from whom, and how we know it works. |
 | `docs/IDEAS.md` | Roadmap | Where the project is going. |
@@ -443,7 +444,7 @@ real board needs: starting blank, provisioning, and saving to flash.
 | 2 | Rules inside the HSM for agent actions (limits, budget, user confirmation) | ✅ Done |
 | 3 | Sign-off from several admins for key creation, deletion, rule changes and admin changes; birth certificates; tamper-evident audit log | ✅ Done |
 | 4 | Fuzzing, glitch (fault-injection) tests, disk-failure tests, threat model | ✅ Done |
-| 5 | Run on a real chip (Raspberry Pi Pico 2): firmware, provisioning, flash storage, secure boot guide | ✅ Built and tested in emulation; on-board testing when the board arrives |
+| 5 | Run on a real chip (Pico 2 / XIAO RP2350): firmware, provisioning, flash storage, secure boot guide | ✅ Built and tested in emulation; on-board testing when the board arrives |
 | 6 | **On the board: encrypted, rollback-proof state (keys in OTP), measured speed** | Next |
 
 More detail in [`docs/IDEAS.md`](docs/IDEAS.md).

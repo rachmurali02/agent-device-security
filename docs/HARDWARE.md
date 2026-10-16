@@ -1,7 +1,8 @@
-# Running the HSM on a real chip (Raspberry Pi Pico 2)
+# Running the HSM on a real chip (RP2350 boards)
 
 The same HSM code that runs in the emulator also runs on a **Raspberry Pi
-Pico 2**, a $5 board built around the **RP2350** chip. The board plugs into
+Pico 2** or a **Seeed Studio XIAO RP2350**: two small, cheap boards built
+around the same **RP2350** chip. The board plugs into
 USB and shows up as a serial port; the `quorum` tool talks to it exactly as
 it talks to the emulator.
 
@@ -15,15 +16,15 @@ it talks to the emulator.
 
 | Item | Why | Notes |
 |---|---|---|
-| **Raspberry Pi Pico 2** | The board (RP2350 chip, 4 MB flash) | Get the plain **Pico 2**. On the Pico 2 **W**, the LED is wired through the wireless chip, so our status LED won't work (everything else would). |
-| **Micro-USB cable that carries data** | Power and connection | Many cheap cables are charge-only and the board won't show up. |
+| **Raspberry Pi Pico 2** *or* **Seeed Studio XIAO RP2350** | The board (RP2350 chip) | Either works; each has its own firmware file. Pico 2: 4 MB flash, micro-USB. XIAO: 2 MB flash (plenty: the firmware is ~128 KB), USB-C, smaller. Avoid the Pico 2 **W**: its LED is wired through the wireless chip, so the status LED won't work. |
+| **USB cable that carries data** | Power and connection | Micro-USB for the Pico 2, USB-C for the XIAO. Many cheap cables are charge-only and the board won't show up. |
 | *(optional)* **Raspberry Pi Debug Probe** | Step-by-step debugging over SWD | Not needed to use the HSM. Note that secure boot can switch debugging off for good. |
 
 ## How it fits together
 
 ```
- your computer                                 Pico 2 (RP2350)
- ─────────────                                 ───────────────
+ your computer                                 RP2350 board
+ ─────────────                                 ────────────
  quorum / quorum-pkcs11                        firmware/rp2350   moves bytes only:
    │  QUORUM_HSM_SERIAL=/dev/ttyACM0             USB serial, flash, random numbers, LED
    │                                              │
@@ -48,28 +49,43 @@ without the board: `./scripts/demo-board.sh`.
 ./scripts/firmware.sh
 ```
 
-This writes `target/firmware/quorum-firmware.elf` and
-`target/firmware/quorum-firmware.uf2` (about 128 KB). GitHub Actions also
-builds them on every push: open a run, and download **quorum-firmware-pico2**
-from its "Artifacts".
+This writes one firmware per board into `target/firmware/` (about 128 KB
+each):
+
+| Board | File to use |
+|---|---|
+| Raspberry Pi Pico 2 | `quorum-firmware-pico2.uf2` |
+| Seeed Studio XIAO RP2350 | `quorum-firmware-xiao.uf2` |
+
+**Use the file for your board.** The HSM keeps its state in the last 64 KB
+of flash, and the two boards have different amounts of flash. GitHub
+Actions also builds both on every push: open a run, and download
+**quorum-firmware** from its "Artifacts".
 
 ## 2. Put it on the board
 
-1. Hold down the **BOOTSEL** button on the board while plugging it in.
+1. Hold down the **BOOTSEL** button while plugging the board in (on the
+   XIAO it's the button marked **B**).
 2. A USB drive called **RP2350** appears.
-3. Copy `quorum-firmware.uf2` onto it. The board restarts into the HSM.
+3. Copy your board's `.uf2` file onto it. The board restarts into the HSM.
 
 Or, with [picotool](https://github.com/raspberrypi/picotool) (version 2 or
-later): `picotool load -x target/firmware/quorum-firmware.elf` (board in
-BOOTSEL mode). From `firmware/rp2350`, `cargo run --release` does the same.
+later): `picotool load -x target/firmware/quorum-firmware-pico2.elf` (board
+in BOOTSEL mode). From `firmware/rp2350`, `cargo run --release` does the
+same (add `--features xiao-rp2350` for the XIAO).
 
-**The LED** shows what the HSM is doing:
+**The LED** (the green one on the Pico 2, the small yellow user LED on the
+XIAO) shows what the HSM is doing:
 
 | LED | Meaning |
 |---|---|
 | Slow blink | **Blank**: waiting to be provisioned |
 | Steady on | **Ready** |
 | Fast blink | **Broken**: flash is damaged or a save failed; every request is refused |
+
+(On the XIAO we assume the user LED lights up when its pin is low, as on
+earlier XIAO boards. If "ready" shows as steady *off*, that assumption was
+wrong: a one-line fix in `firmware/rp2350/src/main.rs`.)
 
 ## 3. Find its serial port
 
@@ -116,7 +132,8 @@ To return a board to blank, erase its state area (the last 64 KB of flash)
 with the board in BOOTSEL mode, using picotool 2:
 
 ```bash
-picotool erase -r 0x103F0000 0x10400000
+picotool erase -r 0x103F0000 0x10400000   # Pico 2 (4 MB)
+picotool erase -r 0x101F0000 0x10200000   # XIAO RP2350 (2 MB)
 ```
 
 This destroys every key on it. Afterwards it's a new HSM with a new identity
@@ -141,7 +158,7 @@ fingerprint is burned into the chip's **OTP** (one-time-programmable) memory.
 openssl ecparam -name secp256k1 -genkey -out private.pem
 
 # 2. Sign the firmware; picotool also writes otp.json (what to burn)
-picotool seal --sign --hash target/firmware/quorum-firmware.elf \
+picotool seal --sign --hash target/firmware/quorum-firmware-pico2.elf \
   quorum-firmware-signed.elf private.pem otp.json
 
 # 3. Check that the signed firmware works BEFORE turning secure boot on
@@ -166,12 +183,35 @@ going further:
 - **Anti-rollback** (`picotool seal --rollback`): stops someone putting an
   older, correctly signed firmware with a known bug back on the board.
 
-## What a Pico 2 does *not* protect yet
+## 7. Testing on the board: the results we're looking for
+
+Work through these in order. Each row is a pass/fail check; write down what
+you see (and the timings) so we can put them in the README.
+
+| # | Do this | Pass if | What it proves |
+|---|---|---|---|
+| 1 | Flash the `.uf2` | The board reboots; the LED **blinks slowly** | The firmware boots on real silicon; flash state area starts blank |
+| 2 | Plug it in, `ls /dev/ttyACM*` | A new serial port appears | USB works |
+| 3 | `quorum keys` | `DENIED … this device is blank` | The board answers over USB with the real protocol |
+| 4 | `quorum provision --pin 123456 --admin alice.pub --admin bob.pub --threshold 2 --out hsm.id` | Prints a serial and identity key; LED goes **steady** | Hardware random numbers, signing and the first flash save work |
+| 5 | Run `provision` again | `DENIED … already set up` | Provisioning really happens only once |
+| 6 | Create an agent key with a $30 budget (2 admins), spend $20 (same commands as `scripts/demo-board.sh`) | Approved; `quorum verify` says VALID | The whole design on the chip; signatures made on the chip check out on the computer |
+| 7 | **Unplug and replug**, then try to spend $15, then $10 | $15 refused (over budget), $10 approved | Keys and counters survive power loss: flash saves work |
+| 8 | Unplug the board **in the middle of** a payment, several times (a loop of payments makes this easy) | After replugging, the board is "ready" and its spending never goes *down* | Real power cuts during flash writes are safe |
+| 9 | `quorum audit pull`, `checkpoint`, `verify` | VALID | The audit log works on the chip |
+| 10 | Time a payment: `time quorum act …` | Note the number | Real-chip speed (expect milliseconds, not the emulator's 0.24 ms: signing on a 150 MHz chip and erasing flash are slower) |
+
+Once these pass, the next steps are measuring speed properly on the board,
+then milestone 6 (encrypted, rollback-proof state) and, on a board you can
+spare, secure boot.
+
+## What these boards do *not* protect yet
 
 The RP2350 is a good chip for learning and for a real prototype, but this is
 not yet a certified HSM. Most importantly:
 
-- **The flash chip is a separate part on the board.** Someone holding the
+- **The flash chip is a separate part on the board** (on both the Pico 2
+  and the XIAO). Someone holding the
   board can read it with a clip-on programmer, and the state on it (keys,
   PIN, counters) is **not encrypted yet**.
 - **Rollback.** For the same reason, someone could save a copy of the flash
