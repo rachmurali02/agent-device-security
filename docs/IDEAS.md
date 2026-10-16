@@ -56,3 +56,47 @@ Runs first on a host emulator, then on real hardware (see below).
 4. ✅ Fuzzing (5 targets incl. stateful whole-HSM), glitch double-checks with fault injection, disk-failure tests, threat model (`docs/THREAT_MODEL.md`); bonus: two-slot storage (2.7x faster safe saves)
 5. ✅ RP2350 (Pico 2) firmware with embassy: USB CDC transport, flash A/B storage with read-back, TRNG, one-time provisioning, LED status; host-testable `quorum-device` crate (power cut at every flash byte op), board emulator over a pseudo serial port, `board` fuzz target, UF2 build in CI, secure boot guide (`docs/HARDWARE.md`). On-board testing pending hardware.
 6. State encryption + authentication with an OTP-held key (page-locked after boot), OTP-backed anti-rollback save counter, secure boot + debug disable + glitch detector on a real board, on-board benchmarks; later: manufacturer-certified identity / attestation
+
+## Proposed extension: the agent wallet (not built yet)
+
+An application on top of the HSM, so real AI agents can use it. Paused in
+favour of running experiments on the board first; a first version of its
+core was written and then reverted (git history: "Agent wallet, part 1").
+
+**The idea:** the agent never holds a key. It asks; the board decides.
+
+```
+ AI agent (Claude Desktop, Cursor, …)
+   │  "pay $15 to coffee-shop.example"      via MCP (the standard way agents use tools)
+   ▼
+ quorum-wallet (on the computer)            holds the board session, waits for approvals,
+   │                                        saves receipts, collects the audit log
+   ▼
+ the board (HSM)                            checks the rules itself; signs or refuses
+        └─ needs the user's OK? ──► web page on the phone: "Approve $35 to airline.example?"
+```
+
+**Pieces:**
+1. Wallet service: one logged-in HSM session; requests that need the user's
+   OK wait until approved, denied or expired; signed receipts (statement +
+   birth certificate) a receiver can check offline; audit log copied out
+   after every action and verified against a signed checkpoint.
+2. MCP server for agents, with tools such as `wallet_status` (what am I
+   allowed to do, how much budget is left) and `wallet_request_action`.
+3. Approval web page: pending requests with Approve / Deny, keys and
+   budgets, history, and the audit log with a "verified" check. Separate
+   tokens for the agent and the user, so an agent can't approve itself.
+
+**Honest limit of a first version:** the approval key would live in the
+wallet on the computer. That fully stops a misbehaving or tricked agent,
+but a hacked computer could fake the "user said yes" step (the board's
+limits and budget would still hold). Stronger options, in order:
+- **Touch to approve on the board:** press the board's button to say yes,
+  like tapping a YubiKey (needs a firmware change; no screen, so the user
+  approves "presence", not details).
+- **A phone app** holding the approval key and showing the action decoded
+  from the exact bytes it signs.
+
+**Open questions:** one board session shared by the wallet and admin
+commands (the serial port is exclusive); how receivers learn a key was
+retired; no real money until the security limits above are closed.

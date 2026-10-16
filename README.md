@@ -446,6 +446,7 @@ real board needs: starting blank, provisioning, and saving to flash.
 | 4 | Fuzzing, glitch (fault-injection) tests, disk-failure tests, threat model | ✅ Done |
 | 5 | Run on a real chip (Pico 2 / XIAO RP2350): firmware, provisioning, flash storage, secure boot guide | ✅ Built and tested in emulation; on-board testing when the board arrives |
 | 6 | **On the board: encrypted, rollback-proof state (keys in OTP), measured speed** | Next |
+| ext | Agent wallet: real AI agents (via MCP) act through the board, with approvals on your phone | Proposed ([`docs/IDEAS.md`](docs/IDEAS.md#proposed-extension-the-agent-wallet-not-built-yet)) |
 
 More detail in [`docs/IDEAS.md`](docs/IDEAS.md).
 
