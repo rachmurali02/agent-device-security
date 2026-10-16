@@ -10,6 +10,7 @@ members = [
     "crates/pkcs11",
     "crates/cli", "crates/bench",
     "crates/device",
+    "crates/wallet",
 ]
 
 [workspace.package]

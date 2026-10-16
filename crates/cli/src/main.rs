@@ -444,47 +444,7 @@ fn bad_reply<E: std::fmt::Debug>(e: E) -> String {
 
 /// Plain-English reasons for every HSM refusal.
 fn explain(s: Status) -> String {
-    let why = match s {
-        Status::Ok => "OK",
-        Status::BadRequest => "the HSM rejected the request as malformed",
-        Status::NotLoggedIn => "you need to log in with the PIN first",
-        Status::AlreadyLoggedIn => "already logged in",
-        Status::PinIncorrect => "wrong PIN (the attempt was counted)",
-        Status::PinLocked => "the HSM is locked after too many wrong PINs",
-        Status::KeyNotFound => "there is no key with that number",
-        Status::StoreFull => "the HSM has no room for more keys",
-        Status::ResponseTooLarge => "the reply would be too large",
-        Status::Fault => "the HSM hit a storage fault and has stopped (restart it)",
-        Status::UsageNotAllowed => "that key cannot be used this way (is it an agent key?)",
-        Status::ActionNotAllowed => "this key's rules do not allow that kind of action",
-        Status::AmountTooHigh => "the amount is over this key's limit for a single payment",
-        Status::BudgetExceeded => "this would go over the key's total spending budget",
-        Status::ConfirmationRequired => {
-            "this action needs the user's confirmation (use --confirm-with <device>)"
-        }
-        Status::ConfirmationInvalid => {
-            "the confirmation is not valid for this exact action from this user's device"
-        }
-        Status::NoChallenge => "the confirmation has expired or was already used",
-        Status::NonceRequired => {
-            "this key only acts on a receiver's payment request (use --request <file>)"
-        }
-        Status::QuorumRequired => {
-            "this needs sign-off from enough admins (see `quorum admin --help`)"
-        }
-        Status::ApprovalInvalid => {
-            "an approval is not valid for this exact proposal, or is from an unknown or repeated admin"
-        }
-        Status::NoAdminChallenge => {
-            "the proposal has expired or was already used (start a new one)"
-        }
-        Status::AuditFull => {
-            "the audit log is full; copy it out first with `quorum audit pull --log <file>`"
-        }
-        Status::NotProvisioned => "this device is blank; set it up first with `quorum provision`",
-        Status::AlreadyProvisioned => "this device was already set up (that only happens once)",
-    };
-    format!("DENIED by HSM: {why}")
+    format!("DENIED by HSM: {}", quorum_client::explain(s))
 }
 
 // ---- formatting helpers ----------------------------------------------------
